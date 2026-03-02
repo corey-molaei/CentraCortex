@@ -1,0 +1,7 @@
+{
+  "base_url": "https://your-org.atlassian.net",
+  "email": "confluence-admin@company.com",
+  "api_token": "<confluence-token>",
+  "space_keys": ["ENG", "KB"],
+  "enabled": true
+}

@@ -1,0 +1,11 @@
+{
+  "provider": "github",
+  "base_url": "https://api.github.com",
+  "token": "<github-or-gitlab-token>",
+  "repositories": ["owner/repo1", "owner/repo2"],
+  "include_readme": true,
+  "include_issues": true,
+  "include_prs": true,
+  "include_wiki": true,
+  "enabled": true
+}

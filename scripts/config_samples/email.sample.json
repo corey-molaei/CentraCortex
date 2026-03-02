@@ -1,0 +1,11 @@
+{
+  "imap_host": "imap.gmail.com",
+  "imap_port": 993,
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "username": "user@company.com",
+  "password": "<app-password>",
+  "use_ssl": true,
+  "folders": ["INBOX", "Sent"],
+  "enabled": true
+}

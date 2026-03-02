@@ -1,0 +1,6 @@
+{
+  "workspace_name": "Acme Workspace",
+  "bot_token": "xoxb-...",
+  "channel_ids": ["C0123456789", "C0987654321"],
+  "enabled": true
+}

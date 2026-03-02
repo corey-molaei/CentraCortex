@@ -1,0 +1,9 @@
+{
+  "base_url": "https://your-org.atlassian.net",
+  "email": "jira-admin@company.com",
+  "api_token": "<jira-api-token>",
+  "project_keys": ["ENG", "OPS"],
+  "issue_types": ["Bug", "Task"],
+  "fields_mapping": {},
+  "enabled": true
+}

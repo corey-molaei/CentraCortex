@@ -1,0 +1,4 @@
+{
+  "allowed_extensions": ["txt", "pdf", "docx"],
+  "enabled": true
+}

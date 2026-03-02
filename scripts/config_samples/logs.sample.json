@@ -1,0 +1,6 @@
+{
+  "folder_path": "/var/log/myapp",
+  "file_glob": "*.log",
+  "parser_type": "plain",
+  "enabled": true
+}

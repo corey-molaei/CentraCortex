@@ -1,0 +1,8 @@
+{
+  "azure_tenant_id": "<azure-tenant-id>",
+  "client_id": "<app-client-id>",
+  "client_secret": "<app-client-secret>",
+  "site_ids": ["site-id-1"],
+  "drive_ids": ["drive-id-1"],
+  "enabled": true
+}
