@@ -39,8 +39,10 @@ class GraphState(TypedDict, total=False):
     inbound_messages: list[dict[str, str]]
     latest_user_message: str
     client_timezone: str | None
+    client_now_iso: str | None
     temperature: float
     provider_id_override: str | None
+    effective_provider_id: str | None
     retrieval_limit: int
 
     safety_flags: list[str]

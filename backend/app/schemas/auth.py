@@ -22,6 +22,11 @@ class TokenResponse(BaseModel):
     memberships: list[TenantMembershipSummary] = Field(default_factory=list)
 
 
+class OAuthStartResponse(BaseModel):
+    auth_url: str
+    state: str
+
+
 class RefreshRequest(BaseModel):
     refresh_token: str
 

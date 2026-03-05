@@ -33,6 +33,9 @@ def run_email_subgraph(
     user_id: str,
     conversation_id: str,
     message: str,
+    client_timezone: str | None,
+    client_now_iso: str | None,
+    provider_id_override: str | None,
 ) -> dict:
     action = maybe_handle_email_chat_action(
         db,
@@ -40,6 +43,9 @@ def run_email_subgraph(
         user_id=user_id,
         conversation_id=conversation_id,
         message=message,
+        client_timezone=client_timezone,
+        client_now_iso=client_now_iso,
+        provider_id_override=provider_id_override,
     )
     if not action or not action.handled:
         return {"intent_handled": False}

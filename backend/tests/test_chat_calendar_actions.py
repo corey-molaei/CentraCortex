@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,7 @@ from app.models.llm_provider import LLMProvider
 from app.models.tenant import Tenant
 from app.models.tenant_membership import TenantMembership
 from app.models.user import User
+from app.services.chat_calendar_actions import ParsedCalendarIntent, _normalize_and_validate_calendar_intent
 from app.services.llm_router import LLMRouter
 
 
@@ -68,6 +70,32 @@ def _seed_connected_google_account(
     return account
 
 
+def _seed_provider(
+    db_session,
+    *,
+    tenant_id: str,
+    name: str = "Parser Provider",
+    model_name: str = "gemma3:4b",
+    is_default: bool = False,
+) -> LLMProvider:
+    provider = LLMProvider(
+        tenant_id=tenant_id,
+        name=name,
+        provider_type="ollama",
+        base_url="http://localhost:11434",
+        api_key_encrypted=None,
+        model_name=model_name,
+        is_default=is_default,
+        is_fallback=False,
+        rate_limit_rpm=1000,
+        config_json={},
+    )
+    db_session.add(provider)
+    db_session.commit()
+    db_session.refresh(provider)
+    return provider
+
+
 @pytest.fixture(autouse=True)
 def google_oauth_settings(monkeypatch):
     monkeypatch.setattr("app.core.config.settings.google_client_id", "google-client-id")
@@ -120,7 +148,21 @@ def test_chat_create_meeting_uses_primary_account_and_client_timezone(client, db
     assert response.status_code == 200
     payload = response.json()
     assert payload["provider_name"] == "Calendar Action Engine"
-    assert "Meeting created" in payload["answer"]
+    assert "Please confirm creating this meeting" in payload["answer"]
+    conversation_id = payload["conversation_id"]
+    assert captured == {}
+
+    confirm = client.post(
+        "/api/v1/chat/complete",
+        json={
+            "messages": [{"role": "user", "content": "yes"}],
+            "conversation_id": conversation_id,
+            "client_timezone": "America/Los_Angeles",
+        },
+        headers=_auth(token, tenant.id),
+    )
+    assert confirm.status_code == 200
+    assert "Meeting created" in confirm.json()["answer"]
 
     assert captured["account_id"] != non_primary.id
     assert captured["account_id"] == primary.id
@@ -174,7 +216,259 @@ def test_chat_create_meeting_includes_attendees(client, db_session, monkeypatch)
 
     assert response.status_code == 200
     payload = response.json()
-    assert "with attendee molaei.kourosh@gmail.com" in payload["answer"]
+    assert "Please confirm creating this meeting" in payload["answer"]
+    conversation_id = payload["conversation_id"]
+    assert captured == {}
+
+    confirm = client.post(
+        "/api/v1/chat/complete",
+        json={
+            "messages": [{"role": "user", "content": "yes"}],
+            "conversation_id": conversation_id,
+            "client_timezone": "Australia/Sydney",
+        },
+        headers=_auth(token, tenant.id),
+    )
+    assert confirm.status_code == 200
+    assert "with attendee molaei.kourosh@gmail.com" in confirm.json()["answer"]
+    assert captured["payload"]["attendees"] == ["molaei.kourosh@gmail.com"]
+
+
+def test_create_natural_phrase_requires_confirmation_not_immediate(client, db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_user(db_session, email="calendar-create-confirm-first@example.com")
+    token = _login(client, email=user.email)
+    _seed_connected_google_account(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        label="Primary",
+        is_primary=True,
+    )
+
+    called = {"count": 0}
+
+    def fake_create_event(*args, **kwargs):
+        called["count"] += 1
+        return {
+            "id": "evt-created",
+            "calendar_id": "primary",
+            "summary": kwargs["payload"]["summary"],
+            "start_datetime": kwargs["payload"]["start_datetime"],
+            "end_datetime": kwargs["payload"]["end_datetime"],
+        }
+
+    monkeypatch.setattr("app.services.chat_calendar_actions.create_event", fake_create_event)
+
+    first = client.post(
+        "/api/v1/chat/complete",
+        json={"messages": [{"role": "user", "content": "create meeting tomorrow 5pm about testing"}], "client_timezone": "UTC"},
+        headers=_auth(token, tenant.id),
+    )
+    assert first.status_code == 200
+    assert "Please confirm creating this meeting" in first.json()["answer"]
+    assert called["count"] == 0
+
+
+def test_create_cancel_does_not_execute(client, db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_user(db_session, email="calendar-create-cancel@example.com")
+    token = _login(client, email=user.email)
+    _seed_connected_google_account(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        label="Primary",
+        is_primary=True,
+    )
+
+    called = {"count": 0}
+
+    def fake_create_event(*args, **kwargs):
+        called["count"] += 1
+        return {
+            "id": "evt-created",
+            "calendar_id": "primary",
+            "summary": kwargs["payload"]["summary"],
+            "start_datetime": kwargs["payload"]["start_datetime"],
+            "end_datetime": kwargs["payload"]["end_datetime"],
+        }
+
+    monkeypatch.setattr("app.services.chat_calendar_actions.create_event", fake_create_event)
+
+    first = client.post(
+        "/api/v1/chat/complete",
+        json={"messages": [{"role": "user", "content": "create meeting tomorrow 5pm"}], "client_timezone": "UTC"},
+        headers=_auth(token, tenant.id),
+    )
+    assert first.status_code == 200
+    conversation_id = first.json()["conversation_id"]
+
+    second = client.post(
+        "/api/v1/chat/complete",
+        json={"messages": [{"role": "user", "content": "no"}], "conversation_id": conversation_id, "client_timezone": "UTC"},
+        headers=_auth(token, tenant.id),
+    )
+    assert second.status_code == 200
+    assert "Cancelled" in second.json()["answer"]
+    assert called["count"] == 0
+
+
+def test_create_parser_fallback_when_llm_parse_fails(client, db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_user(db_session, email="calendar-create-parser-fallback@example.com")
+    token = _login(client, email=user.email)
+    _seed_connected_google_account(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        label="Primary",
+        is_primary=True,
+    )
+
+    monkeypatch.setattr("app.services.chat_calendar_actions._parse_calendar_intent_llm", lambda *args, **kwargs: None)
+
+    captured: dict = {}
+
+    def fake_create_event(db, connector, *, client_id, client_secret, payload):  # noqa: ARG001
+        captured["payload"] = payload
+        return {
+            "id": "evt-created",
+            "calendar_id": payload["calendar_id"],
+            "summary": payload["summary"],
+            "start_datetime": payload["start_datetime"],
+            "end_datetime": payload["end_datetime"],
+        }
+
+    monkeypatch.setattr("app.services.chat_calendar_actions.create_event", fake_create_event)
+
+    first = client.post(
+        "/api/v1/chat/complete",
+        json={"messages": [{"role": "user", "content": "add meeting tomorrow 2pm about fallback"}], "client_timezone": "UTC"},
+        headers=_auth(token, tenant.id),
+    )
+    assert first.status_code == 200
+    assert "Please confirm creating this meeting" in first.json()["answer"]
+    conversation_id = first.json()["conversation_id"]
+
+    second = client.post(
+        "/api/v1/chat/complete",
+        json={"messages": [{"role": "user", "content": "yes"}], "conversation_id": conversation_id, "client_timezone": "UTC"},
+        headers=_auth(token, tenant.id),
+    )
+    assert second.status_code == 200
+    assert "Meeting created" in second.json()["answer"]
+    assert captured["payload"]["summary"] == "fallback"
+
+
+def test_calendar_parser_uses_provider_override_without_fallback(client, db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_user(db_session, email="calendar-parser-override@example.com")
+    token = _login(client, email=user.email)
+    override_provider = _seed_provider(db_session, tenant_id=tenant.id, is_default=True)
+    _seed_connected_google_account(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        label="Primary",
+        is_primary=True,
+    )
+
+    captured: dict = {}
+
+    def fake_chat(self, **kwargs):  # noqa: ARG001
+        captured.update(kwargs)
+        return (
+            SimpleNamespace(id="provider-4b", name="Parser", model_name="gemma3:4b"),
+            {
+                "answer": (
+                    '{"action_type":"calendar_create","target_datetime":"2026-03-04T14:00:00+11:00",'
+                    '"summary":"Override Test","attendees":[]}'
+                ),
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+                "cost_usd": 0.0,
+            },
+        )
+
+    monkeypatch.setattr("app.services.chat_calendar_actions.LLMRouter.chat", fake_chat)
+
+    response = client.post(
+        "/api/v1/chat/complete",
+        json={
+            "messages": [{"role": "user", "content": "add meeting tomorrow 2pm about override"}],
+            "client_timezone": "Australia/Sydney",
+            "provider_id_override": override_provider.id,
+        },
+        headers=_auth(token, tenant.id),
+    )
+    assert response.status_code == 200
+    assert "Please confirm creating this meeting" in response.json()["answer"]
+    assert captured["provider_id_override"] == override_provider.id
+    assert captured["allow_fallback"] is False
+
+
+def test_create_attendees_strict_explicit_emails_only(client, db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_user(db_session, email="calendar-create-attendee-guard@example.com")
+    token = _login(client, email=user.email)
+    _seed_connected_google_account(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        label="Primary",
+        is_primary=True,
+    )
+
+    monkeypatch.setattr(
+        "app.services.chat_calendar_actions._parse_calendar_intent_llm",
+        lambda *args, **kwargs: SimpleNamespace(
+            action_type="calendar_create",
+            target_query="testing",
+            target_datetime=datetime(2026, 2, 25, 6, 0, tzinfo=UTC),
+            target_start_datetime=None,
+            target_end_datetime=None,
+            new_start_datetime=None,
+            new_end_datetime=None,
+            duration_minutes=60,
+            summary="testing",
+            description="",
+            location="",
+            attendees=["molaei.kourosh@gmail.com", "invented@example.com"],
+            account_hint="",
+            calendar_hint="",
+            cleanup_notes=[],
+            confidence=0.9,
+        ),
+    )
+
+    captured: dict = {}
+
+    def fake_create_event(db, connector, *, client_id, client_secret, payload):  # noqa: ARG001
+        captured["payload"] = payload
+        return {
+            "id": "evt-created",
+            "calendar_id": payload["calendar_id"],
+            "summary": payload["summary"],
+            "start_datetime": payload["start_datetime"],
+            "end_datetime": payload["end_datetime"],
+        }
+
+    monkeypatch.setattr("app.services.chat_calendar_actions.create_event", fake_create_event)
+
+    first = client.post(
+        "/api/v1/chat/complete",
+        json={
+            "messages": [{"role": "user", "content": "create meeting with molaei.kourosh@gmail.com tomorrow 5pm about testing"}],
+            "client_timezone": "UTC",
+        },
+        headers=_auth(token, tenant.id),
+    )
+    assert first.status_code == 200
+    conversation_id = first.json()["conversation_id"]
+
+    second = client.post(
+        "/api/v1/chat/complete",
+        json={"messages": [{"role": "user", "content": "yes"}], "conversation_id": conversation_id, "client_timezone": "UTC"},
+        headers=_auth(token, tenant.id),
+    )
+    assert second.status_code == 200
     assert captured["payload"]["attendees"] == ["molaei.kourosh@gmail.com"]
 
 
@@ -563,6 +857,75 @@ def test_chat_list_meetings_intent_returns_nearest_candidates(client, db_session
     assert "1. Salary Review" in answer
 
 
+def test_list_intent_uses_parsed_constraints_and_returns_ranked_results(client, db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_user(db_session, email="calendar-list-parsed@example.com")
+    token = _login(client, email=user.email)
+    _seed_connected_google_account(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        label="Primary",
+        is_primary=True,
+    )
+
+    monkeypatch.setattr(
+        "app.services.chat_calendar_actions._parse_calendar_intent_llm",
+        lambda *args, **kwargs: SimpleNamespace(
+            action_type="calendar_list",
+            target_query="salary",
+            target_datetime=datetime(2026, 2, 25, 4, 0, tzinfo=UTC),
+            target_start_datetime=None,
+            target_end_datetime=None,
+            new_start_datetime=None,
+            new_end_datetime=None,
+            duration_minutes=None,
+            summary="",
+            description="",
+            location="",
+            attendees=[],
+            account_hint="",
+            calendar_hint="",
+            cleanup_notes=[],
+            confidence=0.9,
+        ),
+    )
+
+    calls: list[dict] = []
+
+    def fake_list_events(*args, **kwargs):
+        calls.append(kwargs)
+        return [
+            {
+                "id": "evt-near",
+                "calendar_id": "primary",
+                "summary": "Salary Review",
+                "start_datetime": "2026-02-25T15:02:00+11:00",
+                "end_datetime": "2026-02-25T16:02:00+11:00",
+            },
+            {
+                "id": "evt-far",
+                "calendar_id": "primary",
+                "summary": "Weekly Planning",
+                "start_datetime": "2026-02-25T18:30:00+11:00",
+                "end_datetime": "2026-02-25T19:00:00+11:00",
+            },
+        ]
+
+    monkeypatch.setattr("app.services.chat_calendar_actions.list_events", fake_list_events)
+
+    response = client.post(
+        "/api/v1/chat/complete",
+        json={"messages": [{"role": "user", "content": "upcoming meetings"}], "client_timezone": "Australia/Sydney"},
+        headers=_auth(token, tenant.id),
+    )
+    assert response.status_code == 200
+    answer = response.json()["answer"]
+    assert "closest meetings" in answer.lower()
+    assert "Salary Review" in answer
+    assert calls
+    assert calls[0]["query"] == "salary"
+
+
 def test_chat_list_meetings_falls_back_to_primary_calendar_when_configured_id_missing(client, db_session, monkeypatch):
     tenant, user = _seed_tenant_with_user(db_session, email="calendar-list-fallback@example.com")
     token = _login(client, email=user.email)
@@ -817,7 +1180,17 @@ def test_chat_selects_account_by_partial_label_match(client, db_session, monkeyp
     )
 
     assert response.status_code == 200
-    assert "Meeting created" in response.json()["answer"]
+    assert "Please confirm creating this meeting" in response.json()["answer"]
+    conversation_id = response.json()["conversation_id"]
+    assert captured == {}
+
+    confirm = client.post(
+        "/api/v1/chat/complete",
+        json={"messages": [{"role": "user", "content": "yes"}], "conversation_id": conversation_id, "client_timezone": "UTC"},
+        headers=_auth(token, tenant.id),
+    )
+    assert confirm.status_code == 200
+    assert "Meeting created" in confirm.json()["answer"]
     assert captured["account_id"] == secondary.id
     assert captured["account_id"] != primary.id
 
@@ -889,3 +1262,201 @@ def test_non_calendar_chat_prompt_still_uses_llm(client, db_session, monkeypatch
     payload = response.json()
     assert payload["answer"] == "normal llm answer"
     assert payload["provider_name"] == "primary"
+
+
+def test_chat_create_autocorrects_stale_llm_relative_year(client, db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_user(db_session, email="calendar-relative-correct@example.com")
+    token = _login(client, email=user.email)
+    _seed_connected_google_account(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        label="life",
+        is_primary=True,
+    )
+
+    monkeypatch.setattr(
+        "app.services.chat_calendar_actions._parse_calendar_intent_llm",
+        lambda *args, **kwargs: ParsedCalendarIntent(
+            action_type="calendar_create",
+            target_query="renting gpu local ai model",
+            target_datetime=datetime(2024, 7, 3, 4, 0, tzinfo=UTC),
+            summary="renting GPU and local AI Model",
+            attendees=["molaei.kourosh@gmail.com"],
+        ),
+    )
+
+    captured: dict[str, str] = {}
+
+    def fake_create_event(db, connector, *, client_id, client_secret, payload):  # noqa: ARG001
+        captured["start_datetime"] = payload["start_datetime"]
+        captured["end_datetime"] = payload["end_datetime"]
+        return {
+            "id": "evt-created-relative",
+            "calendar_id": payload["calendar_id"],
+            "summary": payload["summary"],
+            "start_datetime": payload["start_datetime"],
+            "end_datetime": payload["end_datetime"],
+        }
+
+    monkeypatch.setattr("app.services.chat_calendar_actions.create_event", fake_create_event)
+
+    first = client.post(
+        "/api/v1/chat/complete",
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "create a meeting on life at tomorrow 3pm about renting GPU "
+                        "and local AI Model with molaei.kourosh@gmail.com"
+                    ),
+                }
+            ],
+            "client_timezone": "Australia/Sydney",
+            "client_now_iso": "2026-03-02T09:30:00+11:00",
+        },
+        headers=_auth(token, tenant.id),
+    )
+    assert first.status_code == 200
+    conversation_id = first.json()["conversation_id"]
+
+    second = client.post(
+        "/api/v1/chat/complete",
+        json={
+            "messages": [{"role": "user", "content": "yes"}],
+            "conversation_id": conversation_id,
+            "client_timezone": "Australia/Sydney",
+            "client_now_iso": "2026-03-02T09:30:00+11:00",
+        },
+        headers=_auth(token, tenant.id),
+    )
+    assert second.status_code == 200
+
+    created_start = datetime.fromisoformat(captured["start_datetime"])
+    assert created_start.year == 2026
+
+
+def test_normalize_calendar_intent_keeps_explicit_absolute_date():
+    parsed = ParsedCalendarIntent(
+        action_type="calendar_create",
+        target_query="budget planning",
+        target_datetime=datetime(2024, 7, 3, 15, 0, tzinfo=UTC),
+        summary="budget planning",
+    )
+
+    normalized = _normalize_and_validate_calendar_intent(
+        parsed,
+        message="create meeting on 2024-07-03 at 3pm about budget planning",
+        timezone_name="UTC",
+        client_now_iso="2026-03-02T00:00:00Z",
+    )
+
+    assert normalized is not None
+    assert normalized.target_datetime is not None
+    assert normalized.target_datetime.year == 2024
+
+
+def test_create_keeps_specific_about_title_when_llm_returns_generic(client, db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_user(db_session, email="calendar-title-about@example.com")
+    token = _login(client, email=user.email)
+    _seed_connected_google_account(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        label="life",
+        is_primary=True,
+    )
+
+    monkeypatch.setattr(
+        "app.services.chat_calendar_actions._parse_calendar_intent_llm",
+        lambda *args, **kwargs: ParsedCalendarIntent(
+            action_type="calendar_create",
+            target_query="centracortex",
+            target_datetime=datetime(2026, 3, 4, 5, 0, tzinfo=UTC),
+            summary="meeting",
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/chat/complete",
+        json={
+            "messages": [{"role": "user", "content": "add meeting on life tomorrow 4pm about CentraCortex"}],
+            "client_timezone": "Australia/Sydney",
+            "client_now_iso": "2026-03-03T10:00:00+11:00",
+        },
+        headers=_auth(token, tenant.id),
+    )
+
+    assert response.status_code == 200
+    assert "Title: CentraCortex" in response.json()["answer"]
+
+
+def test_create_uses_llm_title_when_deterministic_is_default_and_llm_specific(client, db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_user(db_session, email="calendar-title-llm@example.com")
+    token = _login(client, email=user.email)
+    _seed_connected_google_account(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        label="life",
+        is_primary=True,
+    )
+
+    monkeypatch.setattr(
+        "app.services.chat_calendar_actions._parse_calendar_intent_llm",
+        lambda *args, **kwargs: ParsedCalendarIntent(
+            action_type="calendar_create",
+            target_query="quarterly planning",
+            target_datetime=datetime(2026, 3, 4, 5, 0, tzinfo=UTC),
+            summary="Quarterly Planning Sync",
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/chat/complete",
+        json={
+            "messages": [{"role": "user", "content": "add meeting on life tomorrow 4pm"}],
+            "client_timezone": "Australia/Sydney",
+            "client_now_iso": "2026-03-03T10:00:00+11:00",
+        },
+        headers=_auth(token, tenant.id),
+    )
+
+    assert response.status_code == 200
+    assert "Title: Quarterly Planning Sync" in response.json()["answer"]
+
+
+def test_create_falls_back_to_meeting_when_both_titles_generic_or_empty(client, db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_user(db_session, email="calendar-title-fallback@example.com")
+    token = _login(client, email=user.email)
+    _seed_connected_google_account(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        label="life",
+        is_primary=True,
+    )
+
+    monkeypatch.setattr(
+        "app.services.chat_calendar_actions._parse_calendar_intent_llm",
+        lambda *args, **kwargs: ParsedCalendarIntent(
+            action_type="calendar_create",
+            target_query="",
+            target_datetime=datetime(2026, 3, 4, 5, 0, tzinfo=UTC),
+            summary="event",
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/chat/complete",
+        json={
+            "messages": [{"role": "user", "content": "add meeting tomorrow 4pm"}],
+            "client_timezone": "Australia/Sydney",
+            "client_now_iso": "2026-03-03T10:00:00+11:00",
+        },
+        headers=_auth(token, tenant.id),
+    )
+
+    assert response.status_code == 200
+    assert "Title: Meeting" in response.json()["answer"]

@@ -10,6 +10,7 @@ from app.models.chat_pending_action import ChatPendingAction
 from app.models.chat_pending_email_action import ChatPendingEmailAction
 from app.services.audit import audit_event
 from app.services.chat_runtime import (
+    _resolve_effective_provider_for_conversation,
     _save_message,
     analyze_user_prompt,
     get_or_create_conversation,
@@ -100,6 +101,29 @@ def _load_context_node(state: GraphState) -> GraphState:
     )
     safety = analyze_user_prompt(last_user_msg)
 
+    state["conversation_id"] = conversation.id
+    state["conversation_obj"] = conversation
+    state["thread_id"] = f"{tenant_id}:{user_id}:{conversation.id}"
+    state["latest_user_message"] = last_user_msg
+    state["safety_flags"] = safety.flags
+    state["blocked"] = bool(safety.blocked)
+
+    if not state["blocked"]:
+        effective_provider_id = _resolve_effective_provider_for_conversation(
+            db,
+            tenant_id=tenant_id,
+            conversation=conversation,
+            request_override=state.get("provider_id_override"),
+        )
+        state["effective_provider_id"] = effective_provider_id
+        logger.debug(
+            "chat_provider_pin_resolved",
+            conversation_id=conversation.id,
+            request_provider_id_override=state.get("provider_id_override"),
+            effective_provider_id=effective_provider_id,
+            pinned_model_name=conversation.pinned_model_name,
+        )
+
     _save_message(
         db,
         tenant_id=tenant_id,
@@ -109,13 +133,6 @@ def _load_context_node(state: GraphState) -> GraphState:
         content=last_user_msg,
         safety_flags=safety.flags,
     )
-
-    state["conversation_id"] = conversation.id
-    state["conversation_obj"] = conversation
-    state["thread_id"] = f"{tenant_id}:{user_id}:{conversation.id}"
-    state["latest_user_message"] = last_user_msg
-    state["safety_flags"] = safety.flags
-    state["blocked"] = bool(safety.blocked)
 
     _checkpoint(state, "load_context")
     return state
@@ -227,6 +244,8 @@ def _dispatch_node(state: GraphState) -> GraphState:
             conversation_id=state["conversation_id"],
             message=state["latest_user_message"],
             client_timezone=state.get("client_timezone"),
+            client_now_iso=state.get("client_now_iso"),
+            provider_id_override=state.get("effective_provider_id"),
         )
     elif intent == "email":
         result = run_email_subgraph(
@@ -235,6 +254,9 @@ def _dispatch_node(state: GraphState) -> GraphState:
             user_id=state["user_id"],
             conversation_id=state["conversation_id"],
             message=state["latest_user_message"],
+            client_timezone=state.get("client_timezone"),
+            client_now_iso=state.get("client_now_iso"),
+            provider_id_override=state.get("effective_provider_id"),
         )
     elif intent == "agent":
         result = run_agent_subgraph(
@@ -269,8 +291,9 @@ def _dispatch_node(state: GraphState) -> GraphState:
         conversation=state["conversation_obj"],
         last_user_msg=state["latest_user_message"],
         temperature=state["temperature"],
-        provider_id_override=state.get("provider_id_override"),
+        provider_id_override=state.get("effective_provider_id"),
         retrieval_limit=state["retrieval_limit"],
+        allow_fallback=False,
     )
     state["answer"] = knowledge["answer"]
     state["provider_id"] = provider.id
@@ -296,6 +319,10 @@ def _persist_messages_node(state: GraphState) -> GraphState:
 
     db: Session = state["db"]
     provider_id = state.get("provider_id")
+    # Only persist FK-backed provider ids for actual model answers.
+    # Action engines are synthetic and do not exist in llm_providers.
+    if state.get("interaction_type") != "answer":
+        provider_id = None
     if provider_id in {"blocked", "graph-error"}:
         provider_id = None
 

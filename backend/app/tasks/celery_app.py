@@ -13,12 +13,14 @@ from app.models.connectors.logs_connector import LogsConnector
 from app.models.connectors.sharepoint_connector import SharePointConnector
 from app.models.connectors.slack_connector import SlackConnector
 from app.models.document import Document
+from app.models.workspace_google_integration import WorkspaceGoogleIntegration
 from app.services.audit import audit_event
 from app.services.connectors.code_repo_service import sync_connector as sync_code_repo
 from app.services.connectors.confluence_service import sync_connector as sync_confluence
 from app.services.connectors.db_service import sync_connector as sync_db
 from app.services.connectors.email_user_service import sync_connector as sync_email
 from app.services.connectors.google_service import sync_connector as sync_google
+from app.services.connectors.google_workspace_service import sync_connector as sync_workspace_google
 from app.services.connectors.jira_service import sync_connector as sync_jira
 from app.services.connectors.logs_service import sync_connector as sync_logs
 from app.services.connectors.sharepoint_service import sync_connector as sync_sharepoint
@@ -57,6 +59,10 @@ celery_app.conf.update(
         },
         "sync-google": {
             "task": "app.tasks.celery_app.sync_google_connectors",
+            "schedule": 900.0,
+        },
+        "sync-google-workspace": {
+            "task": "app.tasks.celery_app.sync_google_workspace_integrations",
             "schedule": 900.0,
         },
         "sync-code-repo": {
@@ -133,6 +139,21 @@ def sync_google_connectors() -> dict[str, int]:
     return _run_for_enabled(
         GoogleUserConnector,
         lambda db, connector: sync_google(
+            db,
+            connector,
+            client_id=settings.google_client_id,
+            client_secret=settings.google_client_secret,
+        ),
+    )
+
+
+@celery_app.task(name="app.tasks.celery_app.sync_google_workspace_integrations")
+def sync_google_workspace_integrations() -> dict[str, int]:
+    if not settings.google_client_id or not settings.google_client_secret:
+        return {"success": 0, "failed": 0}
+    return _run_for_enabled(
+        WorkspaceGoogleIntegration,
+        lambda db, connector: sync_workspace_google(
             db,
             connector,
             client_id=settings.google_client_id,

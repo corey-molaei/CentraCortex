@@ -117,6 +117,7 @@ export function completeChat(payload: {
   conversation_id?: string;
   retrieval_limit?: number;
   client_timezone?: string;
+  client_now_iso?: string;
 }) {
   return request<ChatV2Response>("/api/v2/chat/complete", {
     method: "POST",
@@ -131,6 +132,7 @@ export function confirmChatAction(payload: {
   retrieval_limit?: number;
   temperature?: number;
   client_timezone?: string;
+  client_now_iso?: string;
 }) {
   return request<ChatV2Response>("/api/v2/chat/actions/confirm", {
     method: "POST",
@@ -145,6 +147,7 @@ export function selectChatAction(payload: {
   retrieval_limit?: number;
   temperature?: number;
   client_timezone?: string;
+  client_now_iso?: string;
 }) {
   return request<ChatV2Response>("/api/v2/chat/actions/select", {
     method: "POST",

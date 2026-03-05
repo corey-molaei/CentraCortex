@@ -24,6 +24,7 @@ from app.models.user import User
 from app.schemas.auth import (
     AccessTokenOnly,
     LoginRequest,
+    OAuthStartResponse,
     PasswordResetConfirmRequest,
     PasswordResetRequest,
     PasswordResetRequestResponse,
@@ -34,6 +35,7 @@ from app.schemas.auth import (
     TokenResponse,
 )
 from app.services.audit import audit_event
+from app.services.google_auth_login import complete_google_login, start_google_login
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -56,27 +58,30 @@ def _list_memberships(db: Session, user_id: str) -> list[TenantMembershipSummary
     ]
 
 
+def _issue_session_tokens(db: Session, *, user_id: str) -> tuple[str, str, str | None, list[TenantMembershipSummary]]:
+    memberships = _list_memberships(db, user_id)
+    tenant_id = memberships[0].tenant_id if memberships else None
+    jti = secrets.token_hex(24)
+    refresh_token = create_refresh_token(user_id, jti=jti)
+    access_token = create_access_token(user_id, tenant_id=tenant_id)
+    db.add(
+        RefreshToken(
+            user_id=user_id,
+            token_jti=jti,
+            expires_at=datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days),
+        )
+    )
+    db.commit()
+    return access_token, refresh_token, tenant_id, memberships
+
+
 @router.post("/login", response_model=TokenResponse)
 def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)) -> TokenResponse:
     user = db.execute(select(User).where(User.email == payload.email)).scalar_one_or_none()
     if not user or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
-    memberships = _list_memberships(db, user.id)
-    tenant_id = memberships[0].tenant_id if memberships else None
-
-    jti = secrets.token_hex(24)
-    refresh_token = create_refresh_token(user.id, jti=jti)
-    access_token = create_access_token(user.id, tenant_id=tenant_id)
-
-    db.add(
-        RefreshToken(
-            user_id=user.id,
-            token_jti=jti,
-            expires_at=datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days),
-        )
-    )
-    db.commit()
+    access_token, refresh_token, tenant_id, memberships = _issue_session_tokens(db, user_id=user.id)
 
     audit_event(
         db,
@@ -90,6 +95,47 @@ def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)
         ip_address=request.client.host if request.client else None,
     )
 
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        tenant_id=tenant_id,
+        memberships=memberships,
+    )
+
+
+@router.get("/google/start", response_model=OAuthStartResponse)
+def google_login_start(redirect_uri: str, db: Session = Depends(get_db)) -> OAuthStartResponse:
+    try:
+        auth_url, state = start_google_login(db, redirect_uri=redirect_uri)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return OAuthStartResponse(auth_url=auth_url, state=state)
+
+
+@router.get("/google/callback", response_model=TokenResponse)
+def google_login_callback(
+    code: str,
+    state: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> TokenResponse:
+    try:
+        user = complete_google_login(db, code=code, state=state)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    access_token, refresh_token, tenant_id, memberships = _issue_session_tokens(db, user_id=user.id)
+    audit_event(
+        db,
+        event_type="auth.google_login",
+        resource_type="user",
+        resource_id=user.id,
+        action="login",
+        user_id=user.id,
+        tenant_id=tenant_id,
+        request_id=request.headers.get(settings.request_id_header),
+        ip_address=request.client.host if request.client else None,
+    )
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,

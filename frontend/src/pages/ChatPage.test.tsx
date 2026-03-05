@@ -239,8 +239,8 @@ describe("ChatPage", () => {
   });
 
   it("shows user message immediately while assistant response is pending", async () => {
-    let resolveChat: (value: any) => void = () => {};
-    const pendingChat = new Promise<any>((resolve) => {
+    let resolveChat: (value: unknown) => void = () => {};
+    const pendingChat = new Promise<unknown>((resolve) => {
       resolveChat = resolve;
     });
     llmApi.listConversations.mockResolvedValueOnce([]).mockResolvedValueOnce([conversationA]);
@@ -545,5 +545,82 @@ describe("ChatPage", () => {
         })
       );
     });
+  });
+
+  it("shows pinned model state and disables provider override for pinned conversation", async () => {
+    llmApi.listProviders.mockResolvedValue([
+      {
+        id: "provider-4b",
+        tenant_id: "tenant-1",
+        name: "google",
+        provider_type: "ollama",
+        base_url: "http://localhost:11434",
+        model_name: "gemma3:4b",
+        is_default: false,
+        is_fallback: false,
+        rate_limit_rpm: 60,
+        config_json: {},
+        has_api_key: false,
+        requires_oauth: false,
+        oauth_connected: false,
+        created_at: "2026-02-20T10:00:00Z"
+      }
+    ]);
+    const pinnedConversation = {
+      ...conversationA,
+      pinned_provider_id: "provider-4b",
+      pinned_provider_name: "google",
+      pinned_model_name: "gemma3:4b",
+      pinned_at: "2026-02-20T10:00:00Z"
+    };
+    llmApi.listConversations.mockResolvedValueOnce([pinnedConversation]);
+    llmApi.getConversation.mockResolvedValueOnce({
+      ...detailA,
+      pinned_provider_id: "provider-4b",
+      pinned_provider_name: "google",
+      pinned_model_name: "gemma3:4b",
+      pinned_at: "2026-02-20T10:00:00Z"
+    });
+
+    render(
+      <MemoryRouter>
+        <ChatPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Pinned model for this conversation: google / gemma3:4b")).toBeInTheDocument();
+    });
+
+    expect(screen.getByRole("combobox")).toBeDisabled();
+    expect(
+      screen.getByText("This conversation is pinned to google / gemma3:4b. Start a new conversation to switch.")
+    ).toBeInTheDocument();
+  });
+
+  it("shows start-new CTA when pinned provider is unavailable", async () => {
+    llmApi.completeChat.mockRejectedValue(
+      new Error("This conversation is pinned to a provider that is unavailable. Choose a provider and start a new conversation.")
+    );
+
+    render(
+      <MemoryRouter>
+        <ChatPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(llmApi.getConversation).toHaveBeenCalledWith("conv-a");
+    });
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "test request" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/pinned to a provider that is unavailable/)).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Start New Conversation" }));
+    expect(screen.getByText("No messages yet.")).toBeInTheDocument();
   });
 });

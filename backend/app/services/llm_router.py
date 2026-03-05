@@ -1,17 +1,38 @@
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+import structlog
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.security import decrypt_secret
 from app.models.llm_call_log import LLMCallLog
 from app.models.llm_provider import LLMProvider
 from app.services.llm_codex_oauth import get_valid_access_token
+
+logger = structlog.get_logger(__name__)
+
+SECRET_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?i)\b(authorization\s*:\s*bearer)\s+[^\s,;]+"), r"\1 [REDACTED]"),
+    (re.compile(r"(?i)(['\"]authorization['\"]\s*:\s*['\"]bearer\s+)[^'\"]+(['\"])"), r"\1[REDACTED]\2"),
+    (re.compile(r"\bsk-[A-Za-z0-9]{8,}\b"), "sk-[REDACTED]"),
+    (
+        re.compile(r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|token)\b\s*[:=]\s*([^\s,;]+)"),
+        r"\1=[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)(['\"](?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|token)['\"]\s*:\s*['\"])([^'\"]+)(['\"])"
+        ),
+        r"\1[REDACTED]\3",
+    ),
+)
 
 
 class LLMRouter:
@@ -55,6 +76,13 @@ class LLMRouter:
         if count >= provider.rate_limit_rpm:
             raise ValueError(f"Rate limit exceeded for provider {provider.name}")
 
+    def _should_omit_temperature(self, provider: LLMProvider) -> bool:
+        provider_type = (provider.provider_type or "").lower()
+        if provider_type not in {"openai", "vllm", "other"}:
+            return False
+        model_name = (provider.model_name or "").strip().lower()
+        return model_name == "gpt-5-nano" or model_name.startswith("gpt-5-nano-")
+
     def _openai_compatible_call(
         self,
         provider: LLMProvider,
@@ -75,8 +103,9 @@ class LLMRouter:
         payload = {
             "model": provider.model_name,
             "messages": messages,
-            "temperature": temperature,
         }
+        if not self._should_omit_temperature(provider):
+            payload["temperature"] = temperature
 
         with httpx.Client(timeout=30) as client:
             response = client.post(url, headers=headers, json=payload)
@@ -241,18 +270,80 @@ class LLMRouter:
         )
         self.db.commit()
 
+    def _prompt_debug_logging_enabled(self) -> bool:
+        return settings.prompt_debug_logging_enabled and settings.log_level.upper() == "DEBUG"
+
+    def _redact_secrets(self, value: str) -> str:
+        redacted = value
+        for pattern, replacement in SECRET_REPLACEMENTS:
+            redacted = pattern.sub(replacement, redacted)
+        return redacted
+
+    def _sanitize_messages_for_log(self, messages: list[dict[str, str]]) -> list[dict[str, Any]]:
+        max_chars = max(1, settings.prompt_debug_logging_max_chars_per_message)
+        sanitized: list[dict[str, Any]] = []
+        for index, message in enumerate(messages):
+            normalized = dict(message)
+            content = str(normalized.get("content") or "")
+            redacted = self._redact_secrets(content)
+            truncated = len(redacted) > max_chars
+            if truncated:
+                redacted = f"{redacted[:max_chars]}..."
+            normalized["content"] = redacted
+            normalized["message_index"] = index
+            normalized["content_len"] = len(content)
+            normalized["truncated"] = truncated
+            sanitized.append(normalized)
+        return sanitized
+
+    def _log_prompt_debug(
+        self,
+        *,
+        provider: LLMProvider,
+        messages: list[dict[str, str]],
+        attempt_index: int,
+        is_fallback_attempt: bool,
+        error: str | None = None,
+    ) -> None:
+        if not self._prompt_debug_logging_enabled():
+            return
+        payload = {
+            "tenant_id": self.tenant_id,
+            "provider_id": provider.id,
+            "provider_name": provider.name,
+            "provider_type": provider.provider_type,
+            "model_name": provider.model_name,
+            "attempt_index": attempt_index,
+            "is_fallback_attempt": is_fallback_attempt,
+            "message_count": len(messages),
+            "messages": self._sanitize_messages_for_log(messages),
+        }
+        if error is None:
+            logger.debug("llm_prompt_debug", **payload)
+        else:
+            logger.debug("llm_prompt_debug_error", error=error, **payload)
+
     def chat(
         self,
         *,
         messages: list[dict[str, str]],
         temperature: float,
         provider_id_override: str | None = None,
+        allow_fallback: bool = True,
     ) -> tuple[LLMProvider, dict[str, Any]]:
         primary, fallback = self.select_provider(provider_id_override)
+        providers = [primary, fallback] if allow_fallback else [primary]
 
-        for provider in [primary, fallback]:
+        for attempt_index, provider in enumerate(providers, start=1):
             if provider is None:
                 continue
+            is_fallback_attempt = allow_fallback and fallback is not None and provider.id == fallback.id
+            self._log_prompt_debug(
+                provider=provider,
+                messages=messages,
+                attempt_index=attempt_index,
+                is_fallback_attempt=is_fallback_attempt,
+            )
             started = time.perf_counter()
             try:
                 result = self._call_provider(provider, messages, temperature)
@@ -277,7 +368,14 @@ class LLMRouter:
                     response_ms=response_ms,
                     error_message=str(exc),
                 )
-                if provider == fallback or fallback is None:
+                self._log_prompt_debug(
+                    provider=provider,
+                    messages=messages,
+                    attempt_index=attempt_index,
+                    is_fallback_attempt=is_fallback_attempt,
+                    error=str(exc),
+                )
+                if not allow_fallback or provider == fallback or fallback is None:
                     raise
 
         raise RuntimeError("No provider available")
@@ -292,12 +390,12 @@ class LLMRouter:
                     temperature=0.0,
                 )
             elif provider_type in {"openai", "vllm", "other"}:
-                bearer_token = decrypt_secret(provider.api_key_encrypted) if provider.api_key_encrypted else ""
-                headers = {**({"Authorization": f"Bearer {bearer_token}"} if bearer_token else {})}
-                url = f"{provider.base_url.rstrip('/')}/v1/models"
-                with httpx.Client(timeout=15) as client:
-                    response = client.get(url, headers=headers)
-                    response.raise_for_status()
+                # Validate the configured model on the same endpoint family used by chat runtime.
+                self._openai_compatible_call(
+                    provider,
+                    messages=[{"role": "user", "content": "Connection test"}],
+                    temperature=0.0,
+                )
             elif provider_type == "ollama":
                 url = f"{provider.base_url.rstrip('/')}/api/tags"
                 with httpx.Client(timeout=15) as client:

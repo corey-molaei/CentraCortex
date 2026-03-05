@@ -105,6 +105,10 @@ export type ConversationSummary = {
   created_at: string;
   updated_at: string;
   last_message_at: string;
+  pinned_provider_id?: string | null;
+  pinned_provider_name?: string | null;
+  pinned_model_name?: string | null;
+  pinned_at?: string | null;
 };
 
 export type ConversationDetail = {
@@ -113,5 +117,9 @@ export type ConversationDetail = {
   created_at: string;
   updated_at: string;
   last_message_at: string;
+  pinned_provider_id?: string | null;
+  pinned_provider_name?: string | null;
+  pinned_model_name?: string | null;
+  pinned_at?: string | null;
   messages: ConversationMessage[];
 };

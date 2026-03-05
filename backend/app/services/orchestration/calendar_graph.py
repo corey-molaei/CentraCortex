@@ -34,6 +34,8 @@ def run_calendar_subgraph(
     conversation_id: str,
     message: str,
     client_timezone: str | None,
+    client_now_iso: str | None,
+    provider_id_override: str | None,
 ) -> dict:
     action = maybe_handle_calendar_chat_action(
         db,
@@ -42,6 +44,8 @@ def run_calendar_subgraph(
         conversation_id=conversation_id,
         message=message,
         client_timezone=client_timezone,
+        client_now_iso=client_now_iso,
+        provider_id_override=provider_id_override,
     )
     if not action or not action.handled:
         return {"intent_handled": False}

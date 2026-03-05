@@ -34,6 +34,7 @@ def complete_chat_v2(
             conversation_id=payload.conversation_id,
             retrieval_limit=payload.retrieval_limit,
             client_timezone=payload.client_timezone,
+            client_now_iso=payload.client_now_iso,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -76,6 +77,7 @@ def confirm_action_v2(
             conversation_id=payload.conversation_id,
             retrieval_limit=payload.retrieval_limit,
             client_timezone=payload.client_timezone,
+            client_now_iso=payload.client_now_iso,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -120,6 +122,7 @@ def select_action_v2(
             conversation_id=payload.conversation_id,
             retrieval_limit=payload.retrieval_limit,
             client_timezone=payload.client_timezone,
+            client_now_iso=payload.client_now_iso,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

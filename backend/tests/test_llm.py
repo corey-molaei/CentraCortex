@@ -343,6 +343,343 @@ def test_codex_provider_test_connection_connected(client, db_session, monkeypatc
     assert tested.json()["success"] is True
 
 
+def test_openai_provider_test_connection_checks_model_endpoint(client, db_session, monkeypatch):
+    tenant, _ = seed_tenant_with_admin(db_session)
+    token = login(client)
+
+    provider = LLMProvider(
+        tenant_id=tenant.id,
+        name="OpenAI Primary",
+        provider_type="openai",
+        base_url="https://api.openai.com",
+        api_key_encrypted=None,
+        model_name="gpt-4.1-mini",
+        is_default=True,
+        is_fallback=False,
+        rate_limit_rpm=60,
+        config_json={},
+    )
+    db_session.add(provider)
+    db_session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    class _Client:
+        def __init__(self, *args, **kwargs):  # noqa: ARG002
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001,ARG002
+            return False
+
+        def post(self, url, headers=None, json=None):  # noqa: ARG002
+            captured["url"] = url
+            captured["json"] = json or {}
+            return _Response()
+
+    monkeypatch.setattr("app.services.llm_router.httpx.Client", _Client)
+
+    tested = client.post(
+        f"/api/v1/tenant-settings/ai/providers/{provider.id}/test",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert tested.status_code == 200
+    assert tested.json()["success"] is True
+    assert str(captured["url"]).endswith("/v1/chat/completions")
+    assert isinstance(captured["json"], dict)
+    assert captured["json"].get("model") == "gpt-4.1-mini"
+
+
+def test_openai_provider_test_connection_surfaces_model_access_error(client, db_session, monkeypatch):
+    tenant, _ = seed_tenant_with_admin(db_session)
+    token = login(client)
+
+    provider = LLMProvider(
+        tenant_id=tenant.id,
+        name="OpenAI Primary",
+        provider_type="openai",
+        base_url="https://api.openai.com",
+        api_key_encrypted=None,
+        model_name="GPT-5.3-Codex",
+        is_default=True,
+        is_fallback=False,
+        rate_limit_rpm=60,
+        config_json={},
+    )
+    db_session.add(provider)
+    db_session.commit()
+
+    class _Response:
+        status_code = 404
+
+        def json(self):
+            return {
+                "error": {
+                    "message": "The model `GPT-5.3-Codex` does not exist or you do not have access to it."
+                }
+            }
+
+        text = ""
+
+    class _Client:
+        def __init__(self, *args, **kwargs):  # noqa: ARG002
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001,ARG002
+            return False
+
+        def post(self, url, headers=None, json=None):  # noqa: ARG002
+            return _Response()
+
+    monkeypatch.setattr("app.services.llm_router.httpx.Client", _Client)
+
+    tested = client.post(
+        f"/api/v1/tenant-settings/ai/providers/{provider.id}/test",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert tested.status_code == 200
+    assert tested.json()["success"] is False
+    assert "does not exist or you do not have access" in tested.json()["message"]
+
+
+def test_openai_gpt5_nano_omits_temperature(db_session, monkeypatch):
+    tenant, _ = seed_tenant_with_admin(db_session)
+
+    provider = LLMProvider(
+        tenant_id=tenant.id,
+        name="OpenAI Nano",
+        provider_type="openai",
+        base_url="https://api.openai.com",
+        api_key_encrypted=None,
+        model_name="gpt-5-nano",
+        is_default=True,
+        is_fallback=False,
+        rate_limit_rpm=60,
+        config_json={},
+    )
+    db_session.add(provider)
+    db_session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    class _Client:
+        def __init__(self, *args, **kwargs):  # noqa: ARG002
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001,ARG002
+            return False
+
+        def post(self, url, headers=None, json=None):  # noqa: ARG002
+            captured["url"] = url
+            captured["json"] = json or {}
+            return _Response()
+
+    monkeypatch.setattr("app.services.llm_router.httpx.Client", _Client)
+
+    router = LLMRouter(db_session, tenant.id)
+    selected, result = router.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        temperature=0.2,
+        provider_id_override=provider.id,
+        allow_fallback=False,
+    )
+    assert selected.id == provider.id
+    assert result["answer"] == "ok"
+    assert isinstance(captured["json"], dict)
+    assert "temperature" not in captured["json"]
+
+
+def test_openai_gpt5_non_nano_keeps_temperature(db_session, monkeypatch):
+    tenant, _ = seed_tenant_with_admin(db_session)
+
+    provider = LLMProvider(
+        tenant_id=tenant.id,
+        name="OpenAI GPT-5",
+        provider_type="openai",
+        base_url="https://api.openai.com",
+        api_key_encrypted=None,
+        model_name="gpt-5-chat-latest",
+        is_default=True,
+        is_fallback=False,
+        rate_limit_rpm=60,
+        config_json={},
+    )
+    db_session.add(provider)
+    db_session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    class _Client:
+        def __init__(self, *args, **kwargs):  # noqa: ARG002
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001,ARG002
+            return False
+
+        def post(self, url, headers=None, json=None):  # noqa: ARG002
+            captured["json"] = json or {}
+            return _Response()
+
+    monkeypatch.setattr("app.services.llm_router.httpx.Client", _Client)
+
+    router = LLMRouter(db_session, tenant.id)
+    router.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        temperature=0.2,
+        provider_id_override=provider.id,
+        allow_fallback=False,
+    )
+    assert isinstance(captured["json"], dict)
+    assert captured["json"].get("temperature") == 0.2
+
+
+def test_openai_non_gpt5_keeps_temperature(db_session, monkeypatch):
+    tenant, _ = seed_tenant_with_admin(db_session)
+
+    provider = LLMProvider(
+        tenant_id=tenant.id,
+        name="OpenAI 4.1 Nano",
+        provider_type="openai",
+        base_url="https://api.openai.com",
+        api_key_encrypted=None,
+        model_name="gpt-4.1-nano",
+        is_default=True,
+        is_fallback=False,
+        rate_limit_rpm=60,
+        config_json={},
+    )
+    db_session.add(provider)
+    db_session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    class _Client:
+        def __init__(self, *args, **kwargs):  # noqa: ARG002
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001,ARG002
+            return False
+
+        def post(self, url, headers=None, json=None):  # noqa: ARG002
+            captured["json"] = json or {}
+            return _Response()
+
+    monkeypatch.setattr("app.services.llm_router.httpx.Client", _Client)
+
+    router = LLMRouter(db_session, tenant.id)
+    router.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        temperature=0.2,
+        provider_id_override=provider.id,
+        allow_fallback=False,
+    )
+    assert isinstance(captured["json"], dict)
+    assert captured["json"].get("temperature") == 0.2
+
+
+def test_test_connection_gpt5_nano_uses_omitted_temperature(db_session, monkeypatch):
+    tenant, _ = seed_tenant_with_admin(db_session)
+
+    provider = LLMProvider(
+        tenant_id=tenant.id,
+        name="OpenAI Nano",
+        provider_type="openai",
+        base_url="https://api.openai.com",
+        api_key_encrypted=None,
+        model_name="gpt-5-nano",
+        is_default=True,
+        is_fallback=False,
+        rate_limit_rpm=60,
+        config_json={},
+    )
+    db_session.add(provider)
+    db_session.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+
+    class _Client:
+        def __init__(self, *args, **kwargs):  # noqa: ARG002
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001,ARG002
+            return False
+
+        def post(self, url, headers=None, json=None):  # noqa: ARG002
+            captured["json"] = json or {}
+            return _Response()
+
+    monkeypatch.setattr("app.services.llm_router.httpx.Client", _Client)
+
+    router = LLMRouter(db_session, tenant.id)
+    success, message = router.test_connection(provider)
+    assert success is True
+    assert message == "Connection successful"
+    assert isinstance(captured["json"], dict)
+    assert "temperature" not in captured["json"]
+
+
 def test_delete_non_default_provider_succeeds(client, db_session):
     tenant, _ = seed_tenant_with_admin(db_session)
     token = login(client)
@@ -418,7 +755,7 @@ def test_delete_default_provider_blocked(client, db_session):
     assert still_exists is not None
 
 
-def test_chat_failover(client, db_session, monkeypatch):
+def test_chat_pinned_provider_error_no_fallback(client, db_session, monkeypatch):
     tenant, _ = seed_tenant_with_admin(db_session)
     token = login(client)
 
@@ -468,12 +805,8 @@ def test_chat_failover(client, db_session, monkeypatch):
         headers={"Authorization": f"Bearer {token}"},
     )
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["provider_name"] == "fallback"
-    assert payload["answer"] == "fallback answer"
-    assert payload["conversation_id"]
-    assert payload["assistant_message_id"]
+    assert response.status_code == 400
+    assert "pinned provider" in response.json()["detail"].lower()
 
 
 def test_chat_history_citations_and_report(client, db_session, monkeypatch):
@@ -860,7 +1193,7 @@ def test_balanced_fallback_uses_top1_when_filtered_empty(client, db_session, mon
     assert payload["citations"][0]["chunk_id"] == "chunk-low-but-relevant"
 
 
-def test_chat_email_intent_prefers_gmail_hits(client, db_session, monkeypatch):
+def test_chat_email_intent_uses_email_action_engine(client, db_session, monkeypatch):
     tenant, _ = seed_tenant_with_admin(db_session)
     token = login(client)
 
@@ -919,11 +1252,12 @@ def test_chat_email_intent_prefers_gmail_hits(client, db_session, monkeypatch):
     )
     assert response.status_code == 200
     payload = response.json()
-    assert len(payload["citations"]) >= 1
-    assert all(citation["source_type"] == "google_gmail" for citation in payload["citations"])
+    assert payload["provider_name"] == "Email Action Engine"
+    assert payload["citations"] == []
+    assert "connect" in payload["answer"].lower()
 
 
-def test_chat_recent_email_query_uses_recent_source_hits(client, db_session, monkeypatch):
+def test_chat_recent_email_query_prefers_email_action_engine(client, db_session, monkeypatch):
     tenant, _ = seed_tenant_with_admin(db_session)
     token = login(client)
 
@@ -980,8 +1314,8 @@ def test_chat_recent_email_query_uses_recent_source_hits(client, db_session, mon
     )
     assert response.status_code == 200
     payload = response.json()
-    assert len(payload["citations"]) == 2
-    assert all(citation["source_type"] == "google_gmail" for citation in payload["citations"])
+    assert payload["provider_name"] == "Email Action Engine"
+    assert payload["citations"] == []
 
 
 def test_prompt_exfiltration_is_blocked(client, db_session):

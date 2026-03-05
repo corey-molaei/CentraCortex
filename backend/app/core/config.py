@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     ui_base_url: str = "http://localhost:5173"
 
     log_level: str = "INFO"
+    prompt_debug_logging_enabled: bool = True
+    prompt_debug_logging_max_chars_per_message: int = 8000
     request_id_header: str = "X-Request-ID"
     security_headers_enabled: bool = True
     csp_policy: str = (
@@ -64,12 +66,18 @@ class Settings(BaseSettings):
     slack_client_secret: str | None = None
     google_client_id: str | None = None
     google_client_secret: str | None = None
+    google_auth_scopes: str = "openid profile email"
+    google_auth_allowed_domains: str = ""
+    google_auth_default_tenant_name: str = "My Workspace"
     google_oauth_scopes: str = (
         "https://www.googleapis.com/auth/userinfo.email,"
+        "https://www.googleapis.com/auth/userinfo.profile,"
         "https://www.googleapis.com/auth/gmail.readonly,"
         "https://www.googleapis.com/auth/gmail.modify,"
         "https://www.googleapis.com/auth/calendar,"
-        "https://www.googleapis.com/auth/calendar.events"
+        "https://www.googleapis.com/auth/calendar.events,"
+        "https://www.googleapis.com/auth/drive.readonly,"
+        "https://www.googleapis.com/auth/spreadsheets"
     )
     codex_client_id: str | None = None
     codex_oauth_scopes: str = "openid profile email offline_access"
@@ -83,6 +91,18 @@ class Settings(BaseSettings):
     retrieval_fallback_min_score: float = 0.04
     retrieval_min_token_overlap: int = 1
     retrieval_max_citations: int = 5
+    email_tool_llm_intent_parser_enabled: bool = True
+    email_tool_llm_intent_parser_temperature: float = 0.1
+    email_tool_llm_intent_parser_max_tokens: int = 220
+    email_tool_llm_parser_enabled: bool = True
+    email_tool_llm_parser_temperature: float = 0.1
+    email_tool_llm_parser_max_tokens: int = 300
+    email_tool_subject_max_len: int = 160
+    calendar_tool_llm_parser_enabled: bool = True
+    calendar_tool_llm_parser_temperature: float = 0.1
+    calendar_tool_llm_parser_max_tokens: int = 400
+    calendar_tool_default_duration_minutes: int = 60
+    calendar_tool_max_duration_minutes: int = 480
     langgraph_checkpoint_ttl_hours: int = 168
 
     skip_external_healthchecks: bool = False

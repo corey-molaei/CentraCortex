@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
+
+import structlog
 
 try:
     from dateparser import parse as parse_date
@@ -19,8 +23,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.models.action_undo_log import ActionUndoLog
 from app.models.chat_pending_action import ChatPendingAction
 from app.models.connectors.google_user_connector import GoogleUserConnector
+from app.models.workspace_settings import WorkspaceSettings
 from app.services.audit import audit_event
 from app.services.connectors.google_service import (
     create_event,
@@ -31,6 +37,7 @@ from app.services.connectors.google_service import (
     list_user_accounts,
     update_event,
 )
+from app.services.llm_router import LLMRouter
 
 CREATE_ACTION = "calendar_create"
 UPDATE_ACTION = "calendar_update"
@@ -79,12 +86,81 @@ QUERY_STOPWORDS = {
     "future",
 }
 ATTENDEE_SEGMENT_END = r"(?:\s+\b(?:for|from|at|on|about|called|named|titled|tomorrow|today|next)\b|$)"
+CALENDAR_INTENT_TOKENS = {
+    "calendar",
+    "calendars",
+    "meeting",
+    "meetings",
+    "event",
+    "events",
+    "schedule",
+    "reschedule",
+    "standup",
+}
+CALENDAR_COMMAND_PREFIX_PATTERNS = [
+    r"^\s*(?:please\s+)?(?:set|make|create|add|schedule|book)\s+(?:a\s+|an\s+)?(?:meeting|event)\s+",
+    r"^\s*(?:please\s+)?(?:move|reschedule|update|change)\s+",
+]
+GENERIC_MEETING_TITLES = {
+    "meeting",
+    "event",
+    "calendar event",
+    "appointment",
+    "call",
+    "session",
+    "task",
+}
+RELATIVE_TIME_PATTERN = re.compile(
+    r"\b(today|tomorrow|tonight|next|this\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+ABSOLUTE_DATE_PATTERN = re.compile(
+    r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|"
+    r"\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{4}|"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,\s*\d{4})?)\b",
+    re.IGNORECASE,
+)
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
 class CalendarChatResult:
     handled: bool
     answer: str
+
+
+@dataclass
+class ParsedCalendarIntent:
+    action_type: str
+    target_query: str
+    target_datetime: datetime | None = None
+    target_start_datetime: datetime | None = None
+    target_end_datetime: datetime | None = None
+    new_start_datetime: datetime | None = None
+    new_end_datetime: datetime | None = None
+    duration_minutes: int | None = None
+    summary: str | None = None
+    description: str | None = None
+    location: str | None = None
+    attendees: list[str] | None = None
+    account_hint: str | None = None
+    calendar_hint: str | None = None
+    cleanup_notes: list[str] | None = None
+    confidence: float | None = None
+
+
+def _workspace_action_enabled(db: Session, *, tenant_id: str, action_key: str, default: bool = True) -> bool:
+    row = db.execute(
+        select(WorkspaceSettings.allowed_actions_json).where(WorkspaceSettings.tenant_id == tenant_id)
+    ).scalar_one_or_none()
+    if not isinstance(row, dict):
+        return default
+    value = row.get(action_key)
+    if value is None:
+        return default
+    return bool(value)
 
 
 def maybe_handle_calendar_chat_action(
@@ -95,6 +171,8 @@ def maybe_handle_calendar_chat_action(
     conversation_id: str,
     message: str,
     client_timezone: str | None,
+    client_now_iso: str | None = None,
+    provider_id_override: str | None = None,
 ) -> CalendarChatResult | None:
     now_utc = datetime.now(UTC)
 
@@ -136,7 +214,37 @@ def maybe_handle_calendar_chat_action(
         )
 
     action_type = _detect_action_type(message)
+    calendar_like = _looks_calendar_related(message)
+
+    parsed_intent: ParsedCalendarIntent | None = None
+    if action_type is not None or calendar_like:
+        parsed_intent = _parse_calendar_intent_llm(
+            db,
+            tenant_id=tenant_id,
+            message=message,
+            client_timezone=client_timezone,
+            client_now_iso=client_now_iso,
+            provider_id_override=provider_id_override,
+        )
+        parsed_intent = _normalize_and_validate_calendar_intent(
+            parsed_intent,
+            message=message,
+            timezone_name=_safe_timezone(client_timezone),
+            client_now_iso=client_now_iso,
+        )
+        if parsed_intent is not None and parsed_intent.action_type:
+            action_type = parsed_intent.action_type
+
     if action_type is None:
+        if calendar_like:
+            return CalendarChatResult(
+                handled=True,
+                answer=(
+                    "I can help with calendar actions, but I need clearer details. "
+                    "Try: 'create meeting tomorrow 5pm about testing', "
+                    "'move my standup tomorrow to 3pm', or 'upcoming meetings on life'."
+                ),
+            )
         return None
 
     if action_type == LIST_CONNECTED_ACTION:
@@ -144,6 +252,28 @@ def maybe_handle_calendar_chat_action(
             db,
             tenant_id=tenant_id,
             user_id=user_id,
+        )
+
+    if action_type == CREATE_ACTION and not _workspace_action_enabled(
+        db, tenant_id=tenant_id, action_key="calendar_create"
+    ):
+        return CalendarChatResult(
+            handled=True,
+            answer="Calendar create is disabled for this workspace by policy. Enable it in Workspace Settings.",
+        )
+    if action_type == UPDATE_ACTION and not _workspace_action_enabled(
+        db, tenant_id=tenant_id, action_key="calendar_update"
+    ):
+        return CalendarChatResult(
+            handled=True,
+            answer="Calendar update is disabled for this workspace by policy. Enable it in Workspace Settings.",
+        )
+    if action_type == DELETE_ACTION and not _workspace_action_enabled(
+        db, tenant_id=tenant_id, action_key="calendar_delete"
+    ):
+        return CalendarChatResult(
+            handled=True,
+            answer="Calendar delete is disabled for this workspace by policy. Enable it in Workspace Settings.",
         )
 
     if not settings.google_client_id or not settings.google_client_secret:
@@ -155,7 +285,13 @@ def maybe_handle_calendar_chat_action(
             ),
         )
 
-    account = _resolve_account(db, tenant_id=tenant_id, user_id=user_id, message=message)
+    account = _resolve_account(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        message=message,
+        account_hint=parsed_intent.account_hint if parsed_intent else None,
+    )
     if account is None:
         return CalendarChatResult(
             handled=True,
@@ -180,6 +316,8 @@ def maybe_handle_calendar_chat_action(
             account=account,
             message=message,
             client_timezone=client_timezone,
+            client_now_iso=client_now_iso,
+            parsed_intent=parsed_intent,
         )
     if action_type == LIST_ACTION:
         return _handle_list_action(
@@ -187,6 +325,8 @@ def maybe_handle_calendar_chat_action(
             account=account,
             message=message,
             client_timezone=client_timezone,
+            client_now_iso=client_now_iso,
+            parsed_intent=parsed_intent,
         )
 
     return _handle_update_or_delete_request(
@@ -198,6 +338,8 @@ def maybe_handle_calendar_chat_action(
         message=message,
         action_type=action_type,
         client_timezone=client_timezone,
+        client_now_iso=client_now_iso,
+        parsed_intent=parsed_intent,
     )
 
 
@@ -268,9 +410,21 @@ def _handle_list_action(
     account: GoogleUserConnector,
     message: str,
     client_timezone: str | None,
+    client_now_iso: str | None,
+    parsed_intent: ParsedCalendarIntent | None = None,
 ) -> CalendarChatResult:
     tz_name = _safe_timezone(client_timezone)
-    parsed = _parse_list_request(message, timezone_name=tz_name)
+    time_anchor = _resolve_time_anchor(timezone_name=tz_name, client_now_iso=client_now_iso)
+    parsed = (
+        {
+            "target_query": parsed_intent.target_query,
+            "target_datetime": parsed_intent.target_datetime,
+            "target_start_datetime": parsed_intent.target_start_datetime,
+            "target_end_datetime": parsed_intent.target_end_datetime,
+        }
+        if parsed_intent is not None
+        else _parse_list_request(message, timezone_name=tz_name, now_anchor=time_anchor)
+    )
     search_result = _find_event_candidates(
         db,
         account=account,
@@ -310,66 +464,89 @@ def _handle_create_action(
     account: GoogleUserConnector,
     message: str,
     client_timezone: str | None,
+    client_now_iso: str | None,
+    parsed_intent: ParsedCalendarIntent | None = None,
 ) -> CalendarChatResult:
     tz_name = _safe_timezone(client_timezone)
-    start_dt = _parse_datetime_from_text(message, timezone_name=tz_name)
+    time_anchor = _resolve_time_anchor(timezone_name=tz_name, client_now_iso=client_now_iso)
+    start_dt = parsed_intent.target_datetime if parsed_intent is not None else None
+    if start_dt is None and parsed_intent is not None:
+        start_dt = parsed_intent.target_start_datetime
+    if start_dt is None:
+        start_dt = _parse_datetime_from_text(message, timezone_name=tz_name, anchor_now=time_anchor)
     if start_dt is None:
         return CalendarChatResult(
             handled=True,
             answer="I can create the meeting, but I still need a date/time. Example: 'add meeting tomorrow 2pm'.",
         )
 
-    duration_minutes = _extract_duration_minutes(message) or 60
+    duration_minutes = (
+        parsed_intent.duration_minutes if parsed_intent is not None and parsed_intent.duration_minutes else None
+    )
+    if duration_minutes is None:
+        duration_minutes = _extract_duration_minutes(message)
+    duration_minutes = _coerce_duration_minutes(duration_minutes)
     end_dt = start_dt + timedelta(minutes=duration_minutes)
-    summary = _extract_meeting_title(message)
+    deterministic_title = _extract_meeting_title(message)
+    llm_title = _strip_calendar_command_prefix(parsed_intent.summary or "") if parsed_intent else ""
+    if deterministic_title and deterministic_title.lower() != "meeting":
+        summary = deterministic_title
+    elif llm_title and not _is_generic_meeting_title(llm_title):
+        summary = llm_title
+    elif deterministic_title:
+        summary = deterministic_title
+    else:
+        summary = "Meeting"
     attendees = _extract_attendees(message)
+    if parsed_intent is not None and parsed_intent.attendees:
+        attendees = _normalize_attendees(parsed_intent.attendees, message=message)
+    calendar_id = _resolve_calendar_id(
+        account,
+        calendar_hint=parsed_intent.calendar_hint if parsed_intent else None,
+    )
 
     payload = {
-        "calendar_id": "primary",
+        "calendar_id": calendar_id,
         "summary": summary,
-        "description": None,
-        "location": None,
+        "description": _strip_calendar_command_prefix(parsed_intent.description or "") if parsed_intent else None,
+        "location": _strip_calendar_command_prefix(parsed_intent.location or "") if parsed_intent else None,
         "start_datetime": start_dt.isoformat(),
         "end_datetime": end_dt.isoformat(),
         "timezone": tz_name,
         "attendees": attendees,
     }
-
-    try:
-        event = create_event(
-            db,
-            account,
-            client_id=settings.google_client_id,
-            client_secret=settings.google_client_secret,
-            payload=payload,
-        )
-    except ValueError as exc:
-        return CalendarChatResult(handled=True, answer=f"Google calendar create failed: {exc}")
-
+    pending = _replace_pending_action(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        account_id=account.id,
+        action_type=CREATE_ACTION,
+        status=PENDING_CONFIRMATION,
+        payload_json={"timezone": tz_name, "create_payload": payload},
+        candidates_json=[],
+    )
     audit_event(
         db,
-        event_type="chat.calendar.create",
-        resource_type="google_calendar_event",
+        event_type="chat.calendar.pending_confirmation",
+        resource_type="chat_pending_action",
         action="create",
         tenant_id=tenant_id,
         user_id=user_id,
-        resource_id=event.get("id") or None,
+        resource_id=pending.id,
         payload={
             "account_id": account.id,
-            "calendar_id": event.get("calendar_id") or "primary",
             "conversation_id": conversation_id,
-            "summary": summary,
-            "start_datetime": payload["start_datetime"],
-            "end_datetime": payload["end_datetime"],
+            "action_type": CREATE_ACTION,
+            "calendar_id": calendar_id,
         },
     )
-
     return CalendarChatResult(
         handled=True,
-        answer=(
-            f"Meeting created on {account.google_account_email or account.label or 'your primary account'}: "
-            f"'{summary}' from {_humanize_datetime(start_dt, tz_name)} to {_humanize_datetime(end_dt, tz_name)}"
-            f"{_attendee_suffix(attendees)}."
+        answer=_build_create_confirmation_prompt(
+            account=account,
+            payload=payload,
+            timezone_name=tz_name,
         ),
     )
 
@@ -384,9 +561,30 @@ def _handle_update_or_delete_request(
     message: str,
     action_type: str,
     client_timezone: str | None,
+    client_now_iso: str | None,
+    parsed_intent: ParsedCalendarIntent | None = None,
 ) -> CalendarChatResult:
     tz_name = _safe_timezone(client_timezone)
-    parsed = _parse_update_delete_request(message, action_type=action_type, timezone_name=tz_name)
+    time_anchor = _resolve_time_anchor(timezone_name=tz_name, client_now_iso=client_now_iso)
+    parsed = (
+        {
+            "original_message": message,
+            "target_query": parsed_intent.target_query,
+            "target_datetime": parsed_intent.target_datetime,
+            "target_start_datetime": parsed_intent.target_start_datetime,
+            "target_end_datetime": parsed_intent.target_end_datetime,
+            "new_start_datetime": parsed_intent.new_start_datetime,
+            "new_end_datetime": parsed_intent.new_end_datetime,
+            "duration_minutes": parsed_intent.duration_minutes,
+        }
+        if parsed_intent is not None
+        else _parse_update_delete_request(
+            message,
+            action_type=action_type,
+            timezone_name=tz_name,
+            now_anchor=time_anchor,
+        )
+    )
 
     if action_type == UPDATE_ACTION and parsed.get("new_start_datetime") is None:
         return CalendarChatResult(
@@ -577,6 +775,77 @@ def _handle_pending_followup(
     payload = dict(pending.payload_json or {})
     selected_event = dict(payload.get("selected_event") or {})
     tz_name = _safe_timezone(payload.get("timezone") or client_timezone)
+
+    if pending.action_type == CREATE_ACTION:
+        create_payload = dict(payload.get("create_payload") or {})
+        if not create_payload:
+            pending.status = CANCELLED
+            db.commit()
+            return CalendarChatResult(handled=True, answer="I could not resolve the meeting payload to create.")
+        try:
+            event = create_event(
+                db,
+                account,
+                client_id=settings.google_client_id,
+                client_secret=settings.google_client_secret,
+                payload=create_payload,
+            )
+        except ValueError as exc:
+            return CalendarChatResult(handled=True, answer=f"Google calendar create failed: {exc}")
+
+        pending.status = COMPLETED
+        db.commit()
+        audit_event(
+            db,
+            event_type="chat.calendar.create",
+            resource_type="google_calendar_event",
+            action="create",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            resource_id=event.get("id") or None,
+            payload={
+                "account_id": account.id,
+                "calendar_id": event.get("calendar_id") or create_payload.get("calendar_id") or "primary",
+                "conversation_id": conversation_id,
+                "summary": create_payload.get("summary") or "Meeting",
+                "start_datetime": create_payload.get("start_datetime"),
+                "end_datetime": create_payload.get("end_datetime"),
+            },
+        )
+        db.add(
+            ActionUndoLog(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                action_type="calendar_create",
+                resource_type="google_calendar_event",
+                resource_id=str(event.get("id") or ""),
+                undo_payload_json={
+                    "calendar_id": event.get("calendar_id") or create_payload.get("calendar_id") or "primary",
+                    "event_id": event.get("id"),
+                },
+                expires_at=datetime.now(UTC) + timedelta(minutes=15),
+                undone=False,
+            )
+        )
+        db.commit()
+        summary = str(create_payload.get("summary") or "Meeting")
+        start_dt = _from_iso(create_payload.get("start_datetime"))
+        end_dt = _from_iso(create_payload.get("end_datetime"))
+        attendees = [str(item).lower() for item in (create_payload.get("attendees") or []) if str(item).strip()]
+        if start_dt and end_dt:
+            return CalendarChatResult(
+                handled=True,
+                answer=(
+                    f"Meeting created on {account.google_account_email or account.label or 'your primary account'}: "
+                    f"'{summary}' from {_humanize_datetime(start_dt, tz_name)} to {_humanize_datetime(end_dt, tz_name)}"
+                    f"{_attendee_suffix(attendees)}."
+                ),
+            )
+        return CalendarChatResult(
+            handled=True,
+            answer=f"Meeting created on {account.google_account_email or account.label or 'your primary account'}: '{summary}'.",
+        )
 
     if pending.action_type == DELETE_ACTION:
         calendar_id = str(selected_event.get("calendar_id") or "primary")
@@ -880,12 +1149,26 @@ def _find_event_candidates(
     return EventSearchResult(candidates=[])
 
 
-def _parse_update_delete_request(message: str, *, action_type: str, timezone_name: str) -> dict:
+def _parse_update_delete_request(
+    message: str,
+    *,
+    action_type: str,
+    timezone_name: str,
+    now_anchor: datetime | None = None,
+) -> dict:
     cleaned = " ".join(message.strip().split())
     target_query = cleaned
 
-    target_start_datetime, target_end_datetime = _extract_datetime_range(cleaned, timezone_name=timezone_name)
-    target_datetime = target_start_datetime or _parse_datetime_from_text(cleaned, timezone_name=timezone_name)
+    target_start_datetime, target_end_datetime = _extract_datetime_range(
+        cleaned,
+        timezone_name=timezone_name,
+        now_anchor=now_anchor,
+    )
+    target_datetime = target_start_datetime or _parse_datetime_from_text(
+        cleaned,
+        timezone_name=timezone_name,
+        anchor_now=now_anchor,
+    )
     duration_minutes = _extract_duration_minutes(cleaned)
 
     new_start: datetime | None = None
@@ -895,7 +1178,11 @@ def _parse_update_delete_request(message: str, *, action_type: str, timezone_nam
         to_match = re.search(r"\bto\b\s+(.+)$", cleaned, flags=re.IGNORECASE)
         if to_match:
             to_phrase = to_match.group(1).strip()
-            new_start = _parse_datetime_from_text(to_phrase, timezone_name=timezone_name)
+            new_start = _parse_datetime_from_text(
+                to_phrase,
+                timezone_name=timezone_name,
+                anchor_now=now_anchor,
+            )
 
             explicit_date = bool(
                 re.search(r"\b(today|tomorrow|next|on|\d{4}-\d{2}-\d{2})\b", to_phrase, flags=re.IGNORECASE)
@@ -925,10 +1212,18 @@ def _parse_update_delete_request(message: str, *, action_type: str, timezone_nam
     }
 
 
-def _parse_list_request(message: str, *, timezone_name: str) -> dict:
+def _parse_list_request(message: str, *, timezone_name: str, now_anchor: datetime | None = None) -> dict:
     cleaned = " ".join(message.strip().split())
-    target_start_datetime, target_end_datetime = _extract_datetime_range(cleaned, timezone_name=timezone_name)
-    target_datetime = target_start_datetime or _parse_datetime_from_text(cleaned, timezone_name=timezone_name)
+    target_start_datetime, target_end_datetime = _extract_datetime_range(
+        cleaned,
+        timezone_name=timezone_name,
+        now_anchor=now_anchor,
+    )
+    target_datetime = target_start_datetime or _parse_datetime_from_text(
+        cleaned,
+        timezone_name=timezone_name,
+        anchor_now=now_anchor,
+    )
     target_query = _sanitize_target_query(_strip_action_words(cleaned, action_type=LIST_ACTION))
     return {
         "target_query": target_query,
@@ -938,12 +1233,19 @@ def _parse_list_request(message: str, *, timezone_name: str) -> dict:
     }
 
 
-def _resolve_account(db: Session, *, tenant_id: str, user_id: str, message: str) -> GoogleUserConnector | None:
+def _resolve_account(
+    db: Session,
+    *,
+    tenant_id: str,
+    user_id: str,
+    message: str,
+    account_hint: str | None = None,
+) -> GoogleUserConnector | None:
     accounts = list_user_accounts(db, tenant_id=tenant_id, user_id=user_id)
     if not accounts:
         return None
 
-    lowered = message.lower()
+    lowered = f"{message} {account_hint or ''}".lower()
     for account in accounts:
         for value in [account.google_account_email or "", account.label or ""]:
             candidate = value.strip().lower()
@@ -973,6 +1275,331 @@ def _resolve_account(db: Session, *, tenant_id: str, user_id: str, message: str)
 
     primary = get_primary_account(db, tenant_id=tenant_id, user_id=user_id)
     return primary or accounts[0]
+
+
+def _looks_calendar_related(message: str) -> bool:
+    tokens = _tokenize(message)
+    return bool(tokens.intersection(CALENDAR_INTENT_TOKENS))
+
+
+def _parse_calendar_intent_llm(
+    db: Session,
+    *,
+    tenant_id: str,
+    message: str,
+    client_timezone: str | None,
+    client_now_iso: str | None,
+    provider_id_override: str | None,
+) -> ParsedCalendarIntent | None:
+    if not settings.calendar_tool_llm_parser_enabled:
+        return None
+
+    timezone_name = _safe_timezone(client_timezone)
+    time_anchor = _resolve_time_anchor(timezone_name=timezone_name, client_now_iso=client_now_iso)
+    explicit_emails = sorted({value.lower() for value in EMAIL_PATTERN.findall(message)})
+    prompt = (
+        "Extract a calendar action from the user command and return ONLY JSON.\n"
+        "Allowed action_type values: calendar_create, calendar_update, calendar_delete, calendar_list, calendar_list_connected.\n"
+        "JSON keys: action_type,target_query,target_datetime,target_start_datetime,target_end_datetime,"
+        "new_start_datetime,new_end_datetime,duration_minutes,summary,description,location,attendees,"
+        "account_hint,calendar_hint,cleanup_notes,confidence.\n"
+        "Rules:\n"
+        "- Never invent emails/accounts/calendars/event ids.\n"
+        "- attendees must contain only explicit email addresses from the command.\n"
+        "- Datetimes should be ISO-8601 (timezone-aware when possible).\n"
+        "- Relative date words (today/tomorrow/next weekday) must resolve from the provided current_datetime.\n"
+        "- Do not invent past years unless explicitly provided by the user.\n"
+        "- If unknown field, return null or empty string/list.\n"
+        f"- User timezone: {timezone_name}\n"
+        f"- current_datetime: {time_anchor.isoformat()}\n"
+        f"- current_date: {time_anchor.date().isoformat()}\n"
+        f"- Explicit attendee emails in command: {explicit_emails}\n"
+        f"- Command: {message}"
+    )
+
+    try:
+        _, result = LLMRouter(db, tenant_id).chat(
+            messages=[
+                {"role": "system", "content": "You are a strict JSON extraction engine for calendar actions."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=settings.calendar_tool_llm_parser_temperature,
+            provider_id_override=provider_id_override,
+            allow_fallback=False,
+        )
+    except Exception:
+        return None
+
+    parsed = _parse_json_object(str(result.get("answer") or ""))
+    if not isinstance(parsed, dict):
+        return None
+
+    action_type = _normalize_action_type(str(parsed.get("action_type") or ""))
+    if not action_type:
+        action_type = _detect_action_type(message) or ""
+    if not action_type:
+        return None
+
+    return ParsedCalendarIntent(
+        action_type=action_type,
+        target_query=_as_text(parsed.get("target_query"), default=""),
+        target_datetime=_coerce_datetime_field(
+            parsed.get("target_datetime"),
+            timezone_name=timezone_name,
+            anchor_now=time_anchor,
+        ),
+        target_start_datetime=_coerce_datetime_field(
+            parsed.get("target_start_datetime"),
+            timezone_name=timezone_name,
+            anchor_now=time_anchor,
+        ),
+        target_end_datetime=_coerce_datetime_field(
+            parsed.get("target_end_datetime"),
+            timezone_name=timezone_name,
+            anchor_now=time_anchor,
+        ),
+        new_start_datetime=_coerce_datetime_field(
+            parsed.get("new_start_datetime"),
+            timezone_name=timezone_name,
+            anchor_now=time_anchor,
+        ),
+        new_end_datetime=_coerce_datetime_field(
+            parsed.get("new_end_datetime"),
+            timezone_name=timezone_name,
+            anchor_now=time_anchor,
+        ),
+        duration_minutes=_coerce_optional_int(parsed.get("duration_minutes")),
+        summary=_as_text(parsed.get("summary"), default=""),
+        description=_as_text(parsed.get("description"), default=""),
+        location=_as_text(parsed.get("location"), default=""),
+        attendees=_as_string_list(parsed.get("attendees")),
+        account_hint=_as_text(parsed.get("account_hint"), default=""),
+        calendar_hint=_as_text(parsed.get("calendar_hint"), default=""),
+        cleanup_notes=_as_string_list(parsed.get("cleanup_notes")),
+        confidence=_coerce_optional_float(parsed.get("confidence")),
+    )
+
+
+def _normalize_and_validate_calendar_intent(
+    parsed: ParsedCalendarIntent | None,
+    *,
+    message: str,
+    timezone_name: str,
+    client_now_iso: str | None,
+) -> ParsedCalendarIntent | None:
+    if parsed is None:
+        return None
+
+    action_type = _normalize_action_type(parsed.action_type)
+    if not action_type:
+        return None
+
+    time_anchor = _resolve_time_anchor(timezone_name=timezone_name, client_now_iso=client_now_iso)
+
+    target_datetime = parsed.target_datetime
+    target_start_datetime = parsed.target_start_datetime
+    target_end_datetime = parsed.target_end_datetime
+    if action_type == CREATE_ACTION and target_datetime is None:
+        target_datetime = _parse_datetime_from_text(message, timezone_name=timezone_name, anchor_now=time_anchor)
+    if action_type in {UPDATE_ACTION, DELETE_ACTION, LIST_ACTION}:
+        if target_datetime is None and target_start_datetime is None:
+            target_datetime = _parse_datetime_from_text(message, timezone_name=timezone_name, anchor_now=time_anchor)
+
+    if _should_autocorrect_relative_datetime(message):
+        corrected_target = _parse_datetime_from_text(message, timezone_name=timezone_name, anchor_now=time_anchor)
+        if _is_relative_time_mismatch(target_datetime, corrected_target, anchor_now=time_anchor):
+            logger.debug(
+                "calendar_relative_time_corrected",
+                relative_time_corrected=True,
+                llm_time=_to_iso(target_datetime),
+                corrected_time=_to_iso(corrected_target),
+                timezone=timezone_name,
+            )
+            target_datetime = corrected_target
+
+    summary = _strip_calendar_command_prefix(parsed.summary or "")
+    if not summary and action_type == CREATE_ACTION:
+        summary = _extract_meeting_title(message)
+
+    description = _truncate_text(_strip_calendar_command_prefix(parsed.description or ""), 1000) or None
+    location = _truncate_text(_strip_calendar_command_prefix(parsed.location or ""), 240) or None
+    attendees = _normalize_attendees(parsed.attendees or [], message=message)
+    duration_minutes = _coerce_duration_minutes(parsed.duration_minutes)
+    target_query = _sanitize_target_query(parsed.target_query or _strip_action_words(message, action_type=action_type))
+
+    return ParsedCalendarIntent(
+        action_type=action_type,
+        target_query=target_query,
+        target_datetime=target_datetime,
+        target_start_datetime=target_start_datetime,
+        target_end_datetime=target_end_datetime,
+        new_start_datetime=parsed.new_start_datetime,
+        new_end_datetime=parsed.new_end_datetime,
+        duration_minutes=duration_minutes,
+        summary=_truncate_text(summary or "", 120),
+        description=description,
+        location=location,
+        attendees=attendees,
+        account_hint=_truncate_text((parsed.account_hint or "").strip(), 160) or None,
+        calendar_hint=_truncate_text((parsed.calendar_hint or "").strip(), 160) or None,
+        cleanup_notes=parsed.cleanup_notes or [],
+        confidence=parsed.confidence,
+    )
+
+
+def _normalize_action_type(value: str) -> str:
+    raw = value.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        CREATE_ACTION: CREATE_ACTION,
+        "create": CREATE_ACTION,
+        "add": CREATE_ACTION,
+        "calendarcreate": CREATE_ACTION,
+        UPDATE_ACTION: UPDATE_ACTION,
+        "update": UPDATE_ACTION,
+        "move": UPDATE_ACTION,
+        "reschedule": UPDATE_ACTION,
+        DELETE_ACTION: DELETE_ACTION,
+        "delete": DELETE_ACTION,
+        "remove": DELETE_ACTION,
+        "cancel": DELETE_ACTION,
+        LIST_ACTION: LIST_ACTION,
+        "list": LIST_ACTION,
+        "show": LIST_ACTION,
+        "find": LIST_ACTION,
+        LIST_CONNECTED_ACTION: LIST_CONNECTED_ACTION,
+        "list_connected": LIST_CONNECTED_ACTION,
+        "connected": LIST_CONNECTED_ACTION,
+    }
+    return aliases.get(raw, "")
+
+
+def _coerce_datetime_field(value: Any, *, timezone_name: str, anchor_now: datetime | None = None) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    from_iso = _from_iso(text)
+    if from_iso is not None:
+        return from_iso
+    return _parse_datetime_from_text(text, timezone_name=timezone_name, anchor_now=anchor_now)
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_duration_minutes(value: int | None) -> int:
+    if value is None:
+        return settings.calendar_tool_default_duration_minutes
+    return max(1, min(int(value), settings.calendar_tool_max_duration_minutes))
+
+
+def _normalize_attendees(attendees: list[str], *, message: str) -> list[str]:
+    explicit = {value.lower() for value in EMAIL_PATTERN.findall(message)}
+    normalized: list[str] = []
+    for item in attendees:
+        for value in EMAIL_PATTERN.findall(str(item)):
+            lowered = value.lower()
+            if explicit and lowered not in explicit:
+                continue
+            if lowered not in normalized:
+                normalized.append(lowered)
+    return normalized
+
+
+def _resolve_calendar_id(account: GoogleUserConnector, *, calendar_hint: str | None) -> str:
+    configured = [str(item).strip() for item in (account.calendar_ids or ["primary"]) if str(item).strip()]
+    allowed: list[str] = []
+    for calendar_id in configured + ["primary"]:
+        if calendar_id and calendar_id not in allowed:
+            allowed.append(calendar_id)
+
+    if not allowed:
+        return "primary"
+    if not calendar_hint:
+        return allowed[0]
+
+    hint = calendar_hint.strip().lower()
+    for calendar_id in allowed:
+        cid = calendar_id.lower()
+        if hint == cid or hint in cid or cid in hint:
+            return calendar_id
+    return allowed[0]
+
+
+def _strip_calendar_command_prefix(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return text
+    while True:
+        previous = text
+        for pattern in CALENDAR_COMMAND_PREFIX_PATTERNS:
+            text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+        text = text.lstrip(":-,; ")
+        if text == previous:
+            break
+    return text.strip()
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip()
+
+
+def _parse_json_object(value: str) -> dict[str, Any] | None:
+    text = value.strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+
+    candidates = [text]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(text[start : end + 1])
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _as_text(value: Any, *, default: str) -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [part.strip() for part in re.split(r"[,\n]+", value) if part.strip()]
+    return []
 
 
 def _detect_action_type(message: str) -> str | None:
@@ -1017,8 +1644,8 @@ def _extract_duration_minutes(message: str) -> int | None:
     value = int(duration_match.group(1))
     unit = duration_match.group(2).lower()
     if unit.startswith("hour") or unit.startswith("hr"):
-        return value * 60
-    return value
+        value = value * 60
+    return _coerce_duration_minutes(value)
 
 
 def _extract_meeting_title(message: str) -> str:
@@ -1045,6 +1672,15 @@ def _extract_meeting_title(message: str) -> str:
             return title[:120]
 
     return "Meeting"
+
+
+def _is_generic_meeting_title(value: str) -> bool:
+    cleaned = " ".join(value.strip().lower().split())
+    if not cleaned:
+        return True
+    if len(cleaned) < 4:
+        return True
+    return cleaned in GENERIC_MEETING_TITLES
 
 
 def _extract_attendees(message: str) -> list[str]:
@@ -1086,12 +1722,20 @@ def _attendee_suffix(attendees: list[str]) -> str:
     return f" with attendees {', '.join(attendees)}"
 
 
-def _parse_datetime_from_text(text: str, *, timezone_name: str) -> datetime | None:
+def _parse_datetime_from_text(
+    text: str,
+    *,
+    timezone_name: str,
+    anchor_now: datetime | None = None,
+) -> datetime | None:
     normalized_text = _normalize_datetime_text(text)
     sanitized_text = _sanitize_datetime_input(normalized_text)
     tz_name = _safe_timezone(timezone_name)
     tz = ZoneInfo(tz_name)
-    now = datetime.now(tz)
+    now = anchor_now or datetime.now(tz)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    now = now.astimezone(tz)
 
     if search_dates is not None:
         parsed = search_dates(
@@ -1189,6 +1833,27 @@ def _build_candidate_prompt(action_type: str, candidates: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _build_create_confirmation_prompt(*, account: GoogleUserConnector, payload: dict[str, Any], timezone_name: str) -> str:
+    summary = str(payload.get("summary") or "Meeting")
+    calendar_id = str(payload.get("calendar_id") or "primary")
+    attendees = [str(item).lower() for item in (payload.get("attendees") or []) if str(item).strip()]
+    start = _from_iso(str(payload.get("start_datetime") or ""))
+    end = _from_iso(str(payload.get("end_datetime") or ""))
+    if start and end:
+        window = f"{_humanize_datetime(start, timezone_name)} to {_humanize_datetime(end, timezone_name)}"
+    else:
+        window = f"{payload.get('start_datetime') or 'unknown'} to {payload.get('end_datetime') or 'unknown'}"
+    attendee_line = ", ".join(attendees) if attendees else "-"
+    return (
+        "Please confirm creating this meeting (yes/no):\n"
+        f"Account: {account.google_account_email or account.label or 'Primary'}\n"
+        f"Calendar: {calendar_id}\n"
+        f"Title: {summary}\n"
+        f"When: {window}\n"
+        f"Attendees: {attendee_line}"
+    )
+
+
 def _build_confirmation_prompt(action_type: str, candidate: dict) -> str:
     if action_type == UPDATE_ACTION:
         return (
@@ -1262,7 +1927,12 @@ def _is_useful_query(value: str | None) -> bool:
     return any(any(ch.isalpha() for ch in token) and len(token) >= 3 for token in tokens)
 
 
-def _extract_datetime_range(text: str, *, timezone_name: str) -> tuple[datetime | None, datetime | None]:
+def _extract_datetime_range(
+    text: str,
+    *,
+    timezone_name: str,
+    now_anchor: datetime | None = None,
+) -> tuple[datetime | None, datetime | None]:
     range_match = re.search(r"\bfrom\b(?P<start>.+?)\bto\b(?P<end>.+)$", text, flags=re.IGNORECASE)
     if not range_match:
         return None, None
@@ -1270,8 +1940,8 @@ def _extract_datetime_range(text: str, *, timezone_name: str) -> tuple[datetime 
     start_text = range_match.group("start").strip(" ,.")
     end_text = range_match.group("end").strip(" ,.")
 
-    start_dt = _parse_datetime_from_text(start_text, timezone_name=timezone_name)
-    end_dt = _parse_datetime_from_text(end_text, timezone_name=timezone_name)
+    start_dt = _parse_datetime_from_text(start_text, timezone_name=timezone_name, anchor_now=now_anchor)
+    end_dt = _parse_datetime_from_text(end_text, timezone_name=timezone_name, anchor_now=now_anchor)
     if start_dt and end_dt and end_dt <= start_dt:
         end_dt = end_dt + timedelta(days=1)
 
@@ -1339,6 +2009,56 @@ def _safe_timezone(value: str | None) -> str:
         return value
     except Exception:
         return "UTC"
+
+
+def _resolve_time_anchor(*, timezone_name: str, client_now_iso: str | None) -> datetime:
+    tz_name = _safe_timezone(timezone_name)
+    tz = ZoneInfo(tz_name)
+    if not client_now_iso:
+        return datetime.now(tz)
+
+    raw_value = client_now_iso.strip()
+    if not raw_value:
+        return datetime.now(tz)
+
+    if raw_value.endswith("Z"):
+        raw_value = f"{raw_value[:-1]}+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(raw_value)
+    except ValueError:
+        return datetime.now(tz)
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(tz)
+
+
+def _should_autocorrect_relative_datetime(message: str) -> bool:
+    if ABSOLUTE_DATE_PATTERN.search(message):
+        return False
+    return bool(RELATIVE_TIME_PATTERN.search(message))
+
+
+def _is_relative_time_mismatch(
+    llm_datetime: datetime | None,
+    corrected_datetime: datetime | None,
+    *,
+    anchor_now: datetime,
+) -> bool:
+    if llm_datetime is None or corrected_datetime is None:
+        return False
+
+    delta_seconds = abs((llm_datetime - corrected_datetime).total_seconds())
+    if delta_seconds >= 12 * 60 * 60:
+        return True
+
+    anchor_year = anchor_now.astimezone(UTC).year
+    llm_year = llm_datetime.astimezone(UTC).year
+    corrected_year = corrected_datetime.astimezone(UTC).year
+    if llm_year < anchor_year - 1 and corrected_year >= anchor_year - 1:
+        return True
+    return False
 
 
 def _coerce_utc(value: datetime) -> datetime:

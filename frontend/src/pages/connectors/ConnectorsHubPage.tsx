@@ -6,6 +6,7 @@ import { PageContainer } from "../../layout/PageContainer";
 const CONNECTOR_LINKS = [
   { path: "/connectors/jira", label: "Jira", state: "Configured" },
   { path: "/connectors/slack", label: "Slack", state: "Configured" },
+  { path: "/connectors/google-workspace", label: "Google Workspace Integration", state: "Workspace Shared" },
   { path: "/connectors/google", label: "Google (Gmail + Calendar)", state: "Per-user" },
   { path: "/connectors/email", label: "Email", state: "Configured" },
   { path: "/connectors/code-repo", label: "GitHub/GitLab", state: "Configured" },

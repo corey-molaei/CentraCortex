@@ -7,6 +7,7 @@ from typing import Any
 
 import structlog
 from sqlalchemy import delete
+from sqlalchemy.exc import PendingRollbackError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -41,8 +42,10 @@ def _snapshot_state(state: GraphState) -> dict[str, Any]:
         "conversation_id",
         "latest_user_message",
         "client_timezone",
+        "client_now_iso",
         "temperature",
         "provider_id_override",
+        "effective_provider_id",
         "retrieval_limit",
         "safety_flags",
         "blocked",
@@ -85,6 +88,10 @@ def _record_checkpoint(
     conversation_id = state.get("conversation_id")
     if not conversation_id:
         return
+    try:
+        db.rollback()
+    except Exception:  # pragma: no cover - defensive; session may be clean already
+        pass
     checkpoint = LangGraphCheckpoint(
         tenant_id=state["tenant_id"],
         user_id=state["user_id"],
@@ -97,7 +104,12 @@ def _record_checkpoint(
         error_message=error_message,
     )
     db.add(checkpoint)
-    db.commit()
+    try:
+        db.commit()
+    except PendingRollbackError:
+        db.rollback()
+        db.add(checkpoint)
+        db.commit()
 
 
 def cleanup_expired_checkpoints(db: Session) -> int:
@@ -118,6 +130,7 @@ def run_chat_graph(
     conversation_id: str | None,
     retrieval_limit: int,
     client_timezone: str | None,
+    client_now_iso: str | None,
 ) -> GraphExecutionResult:
     state: GraphState = {
         "graph_name": GRAPH_NAME,
@@ -130,6 +143,7 @@ def run_chat_graph(
         "provider_id_override": provider_id_override,
         "retrieval_limit": retrieval_limit,
         "client_timezone": client_timezone,
+        "client_now_iso": client_now_iso,
         "blocked": False,
         "safety_flags": [],
         "citations": [],

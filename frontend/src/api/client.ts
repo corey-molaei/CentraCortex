@@ -21,7 +21,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!response.ok) {
-    const detail = await response.text();
+    let detail = await response.text();
+    try {
+      const parsed = JSON.parse(detail) as { detail?: string; message?: string };
+      detail = parsed.detail || parsed.message || detail;
+    } catch {
+      // keep raw detail when payload is not json
+    }
     throw new Error(detail || `Request failed (${response.status})`);
   }
 
@@ -33,6 +39,16 @@ export async function login(email: string, password: string): Promise<LoginRespo
     method: "POST",
     body: JSON.stringify({ email, password })
   });
+}
+
+export async function googleLoginStart(redirectUri: string): Promise<{ auth_url: string; state: string }> {
+  return request<{ auth_url: string; state: string }>(
+    `/api/v1/auth/google/start?redirect_uri=${encodeURIComponent(redirectUri)}`
+  );
+}
+
+export async function googleLoginCallback(code: string, state: string): Promise<LoginResponse> {
+  return request<LoginResponse>(`/api/v1/auth/google/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`);
 }
 
 export async function refreshToken(): Promise<LoginResponse> {

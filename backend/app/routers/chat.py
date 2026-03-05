@@ -44,6 +44,7 @@ def complete_chat(
             conversation_id=payload.conversation_id,
             retrieval_limit=payload.retrieval_limit,
             client_timezone=payload.client_timezone,
+            client_now_iso=payload.client_now_iso,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

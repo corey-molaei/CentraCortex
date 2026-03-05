@@ -8,6 +8,7 @@ from app.middleware.request_context import RequestContextMiddleware
 from app.middleware.request_signing import RequestSigningMiddleware
 from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.routers import (
+    actions,
     admin_groups,
     admin_policies,
     admin_roles,
@@ -16,17 +17,33 @@ from app.routers import (
     agents,
     ai_models,
     auth,
+    channels,
     chat,
     chat_v2,
     documents,
     governance,
     health,
+    knowledge,
+    recipes,
     retrieval,
     tenants,
     tools,
     users,
+    workspace_settings,
 )
-from app.routers.connectors import code_repo, confluence, db, email, file_upload, google, jira, logs, sharepoint, slack
+from app.routers.connectors import (
+    code_repo,
+    confluence,
+    db,
+    email,
+    file_upload,
+    google,
+    google_workspace,
+    jira,
+    logs,
+    sharepoint,
+    slack,
+)
 
 configure_logging()
 
@@ -75,9 +92,15 @@ app.include_router(chat.router, prefix="/api/v1")
 app.include_router(agents.router, prefix="/api/v1")
 app.include_router(agent_builder.router, prefix="/api/v1")
 app.include_router(governance.router, prefix="/api/v1")
+app.include_router(workspace_settings.router, prefix="/api/v1")
+app.include_router(knowledge.router, prefix="/api/v1")
+app.include_router(recipes.router, prefix="/api/v1")
+app.include_router(actions.router, prefix="/api/v1")
+app.include_router(channels.router, prefix="/api/v1")
 app.include_router(jira.router, prefix="/api/v1")
 app.include_router(slack.router, prefix="/api/v1")
 app.include_router(google.router, prefix="/api/v1")
+app.include_router(google_workspace.router, prefix="/api/v1")
 app.include_router(email.router, prefix="/api/v1")
 app.include_router(code_repo.router, prefix="/api/v1")
 app.include_router(confluence.router, prefix="/api/v1")

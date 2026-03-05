@@ -68,6 +68,7 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = None
     retrieval_limit: int = Field(default=6, ge=1, le=20)
     client_timezone: str | None = None
+    client_now_iso: str | None = None
 
 
 class Citation(BaseModel):
@@ -137,6 +138,7 @@ class ChatActionConfirmRequest(BaseModel):
     retrieval_limit: int = Field(default=8, ge=1, le=20)
     temperature: float = 0.2
     client_timezone: str | None = None
+    client_now_iso: str | None = None
 
 
 class ChatActionSelectRequest(BaseModel):
@@ -146,6 +148,7 @@ class ChatActionSelectRequest(BaseModel):
     retrieval_limit: int = Field(default=8, ge=1, le=20)
     temperature: float = 0.2
     client_timezone: str | None = None
+    client_now_iso: str | None = None
 
 
 class ConversationMessageRead(BaseModel):
@@ -165,6 +168,10 @@ class ConversationSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_message_at: datetime
+    pinned_provider_id: str | None = None
+    pinned_provider_name: str | None = None
+    pinned_model_name: str | None = None
+    pinned_at: datetime | None = None
 
 
 class ConversationDetail(BaseModel):
@@ -173,6 +180,10 @@ class ConversationDetail(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_message_at: datetime
+    pinned_provider_id: str | None = None
+    pinned_provider_name: str | None = None
+    pinned_model_name: str | None = None
+    pinned_at: datetime | None = None
     messages: list[ConversationMessageRead]
 
 

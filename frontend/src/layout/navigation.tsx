@@ -124,25 +124,32 @@ export const navigationSections: NavSection[] = [
       { label: "Groups", path: "/admin/groups", icon: UsersIcon },
       { label: "Roles", path: "/admin/roles", icon: ShieldIcon },
       { label: "Policies", path: "/admin/policies", icon: ShieldIcon },
-      { label: "AI Models", path: "/settings/ai-models", icon: CpuIcon }
+      { label: "AI Models", path: "/settings/ai-models", icon: CpuIcon },
+      { label: "Workspace", path: "/settings/workspace", icon: ShieldIcon }
     ]
   },
   {
     title: "Knowledge",
     items: [
       { label: "Chat", path: "/chat", icon: ChatIcon },
-      { label: "Documents", path: "/documents", icon: DocumentIcon }
+      { label: "Documents", path: "/documents", icon: DocumentIcon },
+      { label: "Health", path: "/knowledge/health", icon: DocumentIcon }
     ]
   },
   {
     title: "Connectors",
-    items: [{ label: "Connectors Hub", path: "/connectors", icon: PlugIcon }]
+    items: [
+      { label: "Connectors Hub", path: "/connectors", icon: PlugIcon },
+      { label: "Google Workspace", path: "/connectors/google-workspace", icon: PlugIcon },
+      { label: "Channels", path: "/channels", icon: PlugIcon }
+    ]
   },
   {
     title: "Agents",
     items: [
       { label: "Agent Catalog", path: "/agents", icon: BotIcon },
-      { label: "Agent Builder", path: "/agent-builder", icon: HammerIcon }
+      { label: "Agent Builder", path: "/agent-builder", icon: HammerIcon },
+      { label: "Recipes", path: "/recipes", icon: HammerIcon }
     ]
   },
   {

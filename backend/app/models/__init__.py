@@ -1,10 +1,16 @@
 from app.models.acl_policy import ACLPolicy
+from app.models.action_undo_log import ActionUndoLog
 from app.models.agent_definition import AgentDefinition
 from app.models.agent_run import AgentRun
 from app.models.agent_spec_version import AgentSpecVersion
 from app.models.agent_style_example import AgentStyleExample
 from app.models.agent_trace_step import AgentTraceStep
 from app.models.audit_log import AuditLog
+from app.models.auth_oauth_state import AuthOAuthState
+from app.models.automation_recipe import AutomationRecipe
+from app.models.channel_facebook_connector import ChannelFacebookConnector
+from app.models.channel_telegram_connector import ChannelTelegramConnector
+from app.models.channel_whatsapp_connector import ChannelWhatsAppConnector
 from app.models.chat_conversation import ChatConversation
 from app.models.chat_feedback import ChatFeedback
 from app.models.chat_message import ChatMessage
@@ -23,6 +29,7 @@ from app.models.connectors.jira_connector import JiraConnector
 from app.models.connectors.logs_connector import LogsConnector
 from app.models.connectors.sharepoint_connector import SharePointConnector
 from app.models.connectors.slack_connector import SlackConnector
+from app.models.conversation_contact_link import ConversationContactLink
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.group import Group
@@ -41,20 +48,32 @@ from app.models.tenant_membership import TenantMembership
 from app.models.tool_approval import ToolApproval
 from app.models.tool_definition import ToolDefinition
 from app.models.user import User
+from app.models.user_identity import UserIdentity
 from app.models.user_role_assignment import UserRoleAssignment
+from app.models.workspace_contact import WorkspaceContact
+from app.models.workspace_google_integration import WorkspaceGoogleIntegration
+from app.models.workspace_recipe_state import WorkspaceRecipeState
+from app.models.workspace_settings import WorkspaceSettings
 
 __all__ = [
     "ACLPolicy",
+    "ActionUndoLog",
     "AgentDefinition",
     "AgentRun",
     "AgentSpecVersion",
     "AgentStyleExample",
     "AgentTraceStep",
+    "AuthOAuthState",
     "AuditLog",
+    "AutomationRecipe",
+    "ChannelFacebookConnector",
+    "ChannelTelegramConnector",
+    "ChannelWhatsAppConnector",
     "CodeRepoConnector",
     "ConfluenceConnector",
     "ConnectorOAuthState",
     "ConnectorSyncRun",
+    "ConversationContactLink",
     "ChatConversation",
     "ChatFeedback",
     "ChatMessage",
@@ -88,4 +107,9 @@ __all__ = [
     "ToolApproval",
     "UserRoleAssignment",
     "User",
+    "UserIdentity",
+    "WorkspaceContact",
+    "WorkspaceGoogleIntegration",
+    "WorkspaceRecipeState",
+    "WorkspaceSettings",
 ]

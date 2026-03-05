@@ -35,6 +35,8 @@ export function ChatPage() {
   const [sending, setSending] = useState(false);
   const [deletingConversationId, setDeletingConversationId] = useState<string | null>(null);
   const [conversationsOpen, setConversationsOpen] = useState(true);
+  const [activePinnedProviderId, setActivePinnedProviderId] = useState<string | null>(null);
+  const [activePinnedModelLabel, setActivePinnedModelLabel] = useState<string | null>(null);
   const clientTimezone = useMemo(
     () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
     []
@@ -48,6 +50,9 @@ export function ChatPage() {
     [providers, providerOverride]
   );
   const nextModelLabel = useMemo(() => {
+    if (activePinnedModelLabel) {
+      return `${activePinnedModelLabel} (conversation pinned)`;
+    }
     if (selectedProvider) {
       return `${selectedProvider.name} / ${selectedProvider.model_name}`;
     }
@@ -55,10 +60,12 @@ export function ChatPage() {
       return `${defaultProvider.name} / ${defaultProvider.model_name} (tenant default)`;
     }
     return "No provider configured";
-  }, [defaultProvider, selectedProvider]);
+  }, [activePinnedModelLabel, defaultProvider, selectedProvider]);
 
   const clearConversationState = useCallback(() => {
     setActiveConversationId(null);
+    setActivePinnedProviderId(null);
+    setActivePinnedModelLabel(null);
     setMessages([]);
     setLatestCitations([]);
     setLastAssistantMessageId(null);
@@ -80,6 +87,12 @@ export function ChatPage() {
     if (target) {
       const detail = await getConversation(target);
       setMessages(detail.messages);
+      setActivePinnedProviderId(detail.pinned_provider_id ?? null);
+      setActivePinnedModelLabel(
+        detail.pinned_provider_name && detail.pinned_model_name
+          ? `${detail.pinned_provider_name} / ${detail.pinned_model_name}`
+          : null
+      );
       const lastAssistant = [...detail.messages].reverse().find((m) => m.role === "assistant");
       setLatestCitations(lastAssistant?.citations ?? []);
       setLastAssistantMessageId(lastAssistant?.id ?? null);
@@ -161,10 +174,11 @@ export function ChatPage() {
     try {
       const response = await completeChat({
         messages: [{ role: "user", content: trimmedPrompt }],
-        provider_id_override: providerOverride || undefined,
+        provider_id_override: (activePinnedProviderId ?? providerOverride) || undefined,
         conversation_id: activeConversationId ?? undefined,
         retrieval_limit: 8,
-        client_timezone: clientTimezone
+        client_timezone: clientTimezone,
+        client_now_iso: new Date().toISOString()
       });
       setModelIndicator(`${response.provider_name} / ${response.model_name}`);
       setLatestCitations(response.citations);
@@ -201,9 +215,10 @@ export function ChatPage() {
       const response = await confirmChatAction({
         conversation_id: activeConversationId,
         confirm,
-        provider_id_override: providerOverride || undefined,
+        provider_id_override: (activePinnedProviderId ?? providerOverride) || undefined,
         retrieval_limit: 8,
-        client_timezone: clientTimezone
+        client_timezone: clientTimezone,
+        client_now_iso: new Date().toISOString()
       });
       setModelIndicator(`${response.provider_name} / ${response.model_name}`);
       setLatestCitations(response.citations);
@@ -233,9 +248,10 @@ export function ChatPage() {
       const response = await selectChatAction({
         conversation_id: activeConversationId,
         selection,
-        provider_id_override: providerOverride || undefined,
+        provider_id_override: (activePinnedProviderId ?? providerOverride) || undefined,
         retrieval_limit: 8,
-        client_timezone: clientTimezone
+        client_timezone: clientTimezone,
+        client_now_iso: new Date().toISOString()
       });
       setModelIndicator(`${response.provider_name} / ${response.model_name}`);
       setLatestCitations(response.citations);
@@ -314,7 +330,20 @@ export function ChatPage() {
         </div>
       </header>
 
-      {error && <div className="mb-4 rounded bg-red-500/15 p-3 text-red-200">{error}</div>}
+      {error && (
+        <div className="mb-4 rounded bg-red-500/15 p-3 text-red-200">
+          <div>{error}</div>
+          {error.includes("pinned to a provider that is unavailable") && (
+            <button
+              className="mt-2 rounded border border-red-300 px-3 py-1 text-sm text-red-100"
+              onClick={startNewConversation}
+              type="button"
+            >
+              Start New Conversation
+            </button>
+          )}
+        </div>
+      )}
       {statusMessage && <div className="mb-4 rounded bg-amber-500/15 p-3 text-amber-200">{statusMessage}</div>}
 
       <div className={`grid gap-4 ${conversationsOpen ? "lg:grid-cols-[320px,1fr,340px]" : "lg:grid-cols-[1fr,340px]"}`}>
@@ -366,7 +395,8 @@ export function ChatPage() {
               <label className="mb-1 block text-xs text-slate-300">Provider Override</label>
               <select
                 className="w-full rounded border border-slate-700 bg-slate-900 p-2"
-                value={providerOverride}
+                disabled={Boolean(activePinnedProviderId)}
+                value={activePinnedProviderId ?? providerOverride}
                 onChange={(e) => {
                   const nextOverride = e.target.value;
                   setProviderOverride(nextOverride);
@@ -397,11 +427,19 @@ export function ChatPage() {
                   </option>
                 ))}
               </select>
+              {activePinnedModelLabel && (
+                <p className="mt-1 text-xs text-slate-400">
+                  This conversation is pinned to {activePinnedModelLabel}. Start a new conversation to switch.
+                </p>
+              )}
             </div>
             <div>
               <label className="mb-1 block text-xs text-slate-300">Model Indicator</label>
               <div className="rounded border border-slate-700 bg-slate-900 p-2 text-sm">{modelIndicator}</div>
               <p className="mt-1 text-xs text-slate-400">Next message uses: {nextModelLabel}</p>
+              {activePinnedModelLabel && (
+                <p className="mt-1 text-xs text-slate-400">Pinned model for this conversation: {activePinnedModelLabel}</p>
+              )}
             </div>
           </div>
 

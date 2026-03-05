@@ -124,6 +124,108 @@ def get_or_create_conversation(
     return convo
 
 
+def _provider_by_id(db: Session, *, tenant_id: str, provider_id: str) -> LLMProvider | None:
+    return db.execute(
+        select(LLMProvider).where(
+            LLMProvider.id == provider_id,
+            LLMProvider.tenant_id == tenant_id,
+        )
+    ).scalar_one_or_none()
+
+
+def _resolve_effective_provider_for_conversation(
+    db: Session,
+    *,
+    tenant_id: str,
+    conversation: ChatConversation,
+    request_override: str | None,
+) -> str | None:
+    requested_provider_id = (request_override or "").strip() or None
+    pinned_provider_id = conversation.pinned_provider_id
+
+    if pinned_provider_id:
+        provider = _provider_by_id(db, tenant_id=tenant_id, provider_id=pinned_provider_id)
+        if provider is None:
+            logger.warning(
+                "chat_provider_pin_unavailable",
+                conversation_id=conversation.id,
+                request_provider_id_override=requested_provider_id,
+                effective_provider_id=pinned_provider_id,
+                pinned_model_name=conversation.pinned_model_name,
+            )
+            raise ValueError(
+                "This conversation is pinned to a provider that is unavailable. "
+                "Choose a provider and start a new conversation."
+            )
+
+        if requested_provider_id and requested_provider_id != pinned_provider_id:
+            logger.info(
+                "chat_provider_pin_mismatch_ignored",
+                conversation_id=conversation.id,
+                request_provider_id_override=requested_provider_id,
+                effective_provider_id=pinned_provider_id,
+                pinned_model_name=provider.model_name,
+            )
+
+        changed = False
+        if conversation.pinned_provider_name != provider.name:
+            conversation.pinned_provider_name = provider.name
+            changed = True
+        if conversation.pinned_model_name != provider.model_name:
+            conversation.pinned_model_name = provider.model_name
+            changed = True
+        if conversation.pinned_at is None:
+            conversation.pinned_at = utcnow()
+            changed = True
+        if changed:
+            db.commit()
+
+        logger.debug(
+            "chat_provider_pin_resolved",
+            conversation_id=conversation.id,
+            request_provider_id_override=requested_provider_id,
+            effective_provider_id=pinned_provider_id,
+            pinned_model_name=provider.model_name,
+        )
+        return pinned_provider_id
+
+    router = LLMRouter(db, tenant_id)
+    try:
+        selected, _ = router.select_provider(requested_provider_id)
+    except ValueError:
+        if requested_provider_id is not None:
+            raise
+        logger.debug(
+            "chat_provider_pin_resolved",
+            conversation_id=conversation.id,
+            request_provider_id_override=requested_provider_id,
+            effective_provider_id=None,
+            pinned_model_name=None,
+        )
+        return None
+    conversation.pinned_provider_id = selected.id
+    conversation.pinned_provider_name = selected.name
+    conversation.pinned_model_name = selected.model_name
+    conversation.pinned_at = utcnow()
+    db.commit()
+
+    logger.info(
+        "chat_provider_pin_created",
+        conversation_id=conversation.id,
+        request_provider_id_override=requested_provider_id,
+        effective_provider_id=selected.id,
+        pinned_model_name=selected.model_name,
+    )
+    logger.debug(
+        "chat_provider_pin_resolved",
+        conversation_id=conversation.id,
+        request_provider_id_override=requested_provider_id,
+        effective_provider_id=selected.id,
+        pinned_model_name=selected.model_name,
+    )
+    return selected.id
+
+
 def _serialize_citations(items: list[Citation]) -> list[dict]:
     return [item.model_dump() for item in items]
 
@@ -405,155 +507,8 @@ def run_knowledge_generation(
     temperature: float,
     provider_id_override: str | None,
     retrieval_limit: int,
+    allow_fallback: bool = True,
 ) -> tuple[LLMProvider, dict]:
-    provider, result = run_knowledge_generation(
-        db,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        conversation=conversation,
-        last_user_msg=last_user_msg,
-        temperature=temperature,
-        provider_id_override=provider_id_override,
-        retrieval_limit=retrieval_limit,
-    )
-    citations = result["citations"]
-    result["citations"] = citations
-    return provider, result
-
-
-def run_chat(
-    db: Session,
-    *,
-    tenant_id: str,
-    user_id: str,
-    user_messages: list[dict],
-    temperature: float,
-    provider_id_override: str | None,
-    conversation_id: str | None,
-    retrieval_limit: int,
-    client_timezone: str | None = None,
-):
-    if not user_messages:
-        raise ValueError("At least one message is required")
-
-    last_user_msg = user_messages[-1].get("content", "").strip()
-    if not last_user_msg:
-        raise ValueError("Last user message is empty")
-
-    conversation = get_or_create_conversation(
-        db,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-        seed_message=last_user_msg,
-    )
-    safety = analyze_user_prompt(last_user_msg)
-
-    _save_message(
-        db,
-        tenant_id=tenant_id,
-        conversation=conversation,
-        user_id=user_id,
-        role="user",
-        content=last_user_msg,
-        safety_flags=safety.flags,
-    )
-
-    if safety.blocked:
-        blocked_text = (
-            "I cannot assist with requests to reveal secrets, credentials, or protected system instructions."
-        )
-        blocked_msg = _save_message(
-            db,
-            tenant_id=tenant_id,
-            conversation=conversation,
-            user_id=None,
-            role="assistant",
-            content=blocked_text,
-            safety_flags=safety.flags,
-        )
-        return conversation, blocked_msg, None, {
-            "answer": blocked_text,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-            "citations": [],
-            "blocked": True,
-            "safety_flags": safety.flags,
-        }
-
-    calendar_action = maybe_handle_calendar_chat_action(
-        db,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        conversation_id=conversation.id,
-        message=last_user_msg,
-        client_timezone=client_timezone,
-    )
-    if calendar_action and calendar_action.handled:
-        assistant_msg = _save_message(
-            db,
-            tenant_id=tenant_id,
-            conversation=conversation,
-            user_id=None,
-            role="assistant",
-            content=calendar_action.answer,
-            citations=[],
-            safety_flags=safety.flags,
-            llm_model_name="google-calendar-action",
-        )
-        action_provider = SimpleNamespace(
-            id="google-calendar-action",
-            name="Calendar Action Engine",
-            model_name="google-calendar-action",
-        )
-        return conversation, assistant_msg, action_provider, {
-            "answer": calendar_action.answer,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-            "citations": [],
-            "blocked": False,
-            "safety_flags": safety.flags,
-        }
-
-    email_action = maybe_handle_email_chat_action(
-        db,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        conversation_id=conversation.id,
-        message=last_user_msg,
-    )
-    if email_action and email_action.handled:
-        assistant_msg = _save_message(
-            db,
-            tenant_id=tenant_id,
-            conversation=conversation,
-            user_id=None,
-            role="assistant",
-            content=email_action.answer,
-            citations=[],
-            safety_flags=safety.flags,
-            llm_model_name="email-action",
-        )
-        action_provider = SimpleNamespace(
-            id="email-action",
-            name="Email Action Engine",
-            model_name="email-action",
-        )
-        return conversation, assistant_msg, action_provider, {
-            "answer": email_action.answer,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-            "citations": [],
-            "blocked": False,
-            "safety_flags": safety.flags,
-        }
-
     query_tokens = _tokenize_text(last_user_msg)
     recent_email_count = _extract_recent_email_request_count(last_user_msg)
     if recent_email_count:
@@ -632,7 +587,178 @@ def run_chat(
         messages=llm_messages,
         temperature=temperature,
         provider_id_override=provider_id_override,
+        allow_fallback=allow_fallback,
     )
+    result["citations"] = citations
+    return provider, result
+
+
+def run_chat(
+    db: Session,
+    *,
+    tenant_id: str,
+    user_id: str,
+    user_messages: list[dict],
+    temperature: float,
+    provider_id_override: str | None,
+    conversation_id: str | None,
+    retrieval_limit: int,
+    client_timezone: str | None = None,
+    client_now_iso: str | None = None,
+):
+    if not user_messages:
+        raise ValueError("At least one message is required")
+
+    last_user_msg = user_messages[-1].get("content", "").strip()
+    if not last_user_msg:
+        raise ValueError("Last user message is empty")
+
+    conversation = get_or_create_conversation(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        seed_message=last_user_msg,
+    )
+    safety = analyze_user_prompt(last_user_msg)
+
+    if not safety.blocked:
+        effective_provider_id = _resolve_effective_provider_for_conversation(
+            db,
+            tenant_id=tenant_id,
+            conversation=conversation,
+            request_override=provider_id_override,
+        )
+    else:
+        effective_provider_id = None
+
+    _save_message(
+        db,
+        tenant_id=tenant_id,
+        conversation=conversation,
+        user_id=user_id,
+        role="user",
+        content=last_user_msg,
+        safety_flags=safety.flags,
+    )
+
+    if safety.blocked:
+        blocked_text = (
+            "I cannot assist with requests to reveal secrets, credentials, or protected system instructions."
+        )
+        blocked_msg = _save_message(
+            db,
+            tenant_id=tenant_id,
+            conversation=conversation,
+            user_id=None,
+            role="assistant",
+            content=blocked_text,
+            safety_flags=safety.flags,
+        )
+        return conversation, blocked_msg, None, {
+            "answer": blocked_text,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "citations": [],
+            "blocked": True,
+            "safety_flags": safety.flags,
+        }
+
+    calendar_action = maybe_handle_calendar_chat_action(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation.id,
+        message=last_user_msg,
+        client_timezone=client_timezone,
+        client_now_iso=client_now_iso,
+        provider_id_override=effective_provider_id,
+    )
+    if calendar_action and calendar_action.handled:
+        assistant_msg = _save_message(
+            db,
+            tenant_id=tenant_id,
+            conversation=conversation,
+            user_id=None,
+            role="assistant",
+            content=calendar_action.answer,
+            citations=[],
+            safety_flags=safety.flags,
+            llm_model_name="google-calendar-action",
+        )
+        action_provider = SimpleNamespace(
+            id="google-calendar-action",
+            name="Calendar Action Engine",
+            model_name="google-calendar-action",
+        )
+        return conversation, assistant_msg, action_provider, {
+            "answer": calendar_action.answer,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "citations": [],
+            "blocked": False,
+            "safety_flags": safety.flags,
+        }
+
+    email_action = maybe_handle_email_chat_action(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation.id,
+        message=last_user_msg,
+        client_timezone=client_timezone,
+        client_now_iso=client_now_iso,
+        provider_id_override=effective_provider_id,
+    )
+    if email_action and email_action.handled:
+        assistant_msg = _save_message(
+            db,
+            tenant_id=tenant_id,
+            conversation=conversation,
+            user_id=None,
+            role="assistant",
+            content=email_action.answer,
+            citations=[],
+            safety_flags=safety.flags,
+            llm_model_name="email-action",
+        )
+        action_provider = SimpleNamespace(
+            id="email-action",
+            name="Email Action Engine",
+            model_name="email-action",
+        )
+        return conversation, assistant_msg, action_provider, {
+            "answer": email_action.answer,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "citations": [],
+            "blocked": False,
+            "safety_flags": safety.flags,
+        }
+
+    try:
+        provider, result = run_knowledge_generation(
+            db,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation=conversation,
+            last_user_msg=last_user_msg,
+            temperature=temperature,
+            provider_id_override=effective_provider_id,
+            retrieval_limit=retrieval_limit,
+            allow_fallback=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(
+            f"Pinned provider failed and fallback is disabled for this conversation: {exc}"
+        ) from exc
+    citations = result["citations"]
 
     assistant_msg = _save_message(
         db,
@@ -674,6 +800,7 @@ def run_chat_v2(
     conversation_id: str | None,
     retrieval_limit: int,
     client_timezone: str | None = None,
+    client_now_iso: str | None = None,
 ):
     from app.services.orchestration.langgraph_runtime import run_chat_graph
 
@@ -687,6 +814,7 @@ def run_chat_v2(
         conversation_id=conversation_id,
         retrieval_limit=retrieval_limit,
         client_timezone=client_timezone,
+        client_now_iso=client_now_iso,
     )
 
 
@@ -708,6 +836,10 @@ def list_conversations(db: Session, *, tenant_id: str, user_id: str, limit: int 
             created_at=row.created_at,
             updated_at=row.updated_at,
             last_message_at=row.last_message_at,
+            pinned_provider_id=row.pinned_provider_id,
+            pinned_provider_name=row.pinned_provider_name,
+            pinned_model_name=row.pinned_model_name,
+            pinned_at=row.pinned_at,
         )
         for row in rows
     ]
@@ -736,6 +868,10 @@ def get_conversation_detail(db: Session, *, tenant_id: str, user_id: str, conver
         created_at=convo.created_at,
         updated_at=convo.updated_at,
         last_message_at=convo.last_message_at,
+        pinned_provider_id=convo.pinned_provider_id,
+        pinned_provider_name=convo.pinned_provider_name,
+        pinned_model_name=convo.pinned_model_name,
+        pinned_at=convo.pinned_at,
         messages=[
             ConversationMessageRead(
                 id=msg.id,

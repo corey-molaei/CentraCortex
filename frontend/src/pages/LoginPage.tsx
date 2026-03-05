@@ -1,6 +1,6 @@
 import { FormEvent, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { login } from "../api/client";
+import { googleLoginStart, login } from "../api/client";
 import { sessionStore } from "../api/session";
 
 export function LoginPage() {
@@ -8,6 +8,7 @@ export function LoginPage() {
   const [password, setPassword] = useState("password123");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const navigate = useNavigate();
 
   async function onSubmit(event: FormEvent) {
@@ -32,6 +33,19 @@ export function LoginPage() {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function onGoogleLogin() {
+    setError(null);
+    setGoogleLoading(true);
+    try {
+      const redirectUri = `${window.location.origin}/login/google/callback`;
+      const response = await googleLoginStart(redirectUri);
+      window.location.href = response.auth_url;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Google login start failed");
+      setGoogleLoading(false);
     }
   }
 
@@ -67,6 +81,15 @@ export function LoginPage() {
           disabled={loading}
         >
           {loading ? "Signing in..." : "Sign In"}
+        </button>
+
+        <button
+          className="mt-3 w-full rounded border border-slate-600 px-4 py-2 font-semibold text-slate-100 transition hover:bg-white/10 disabled:opacity-70"
+          disabled={googleLoading}
+          onClick={onGoogleLogin}
+          type="button"
+        >
+          {googleLoading ? "Redirecting to Google..." : "Sign in with Google"}
         </button>
       </form>
     </main>
