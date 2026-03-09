@@ -76,10 +76,32 @@ export type GoogleAccountPayload = {
   label?: string | null;
   enabled: boolean;
   is_primary?: boolean;
+  is_workspace_default?: boolean;
   gmail_enabled: boolean;
   gmail_labels: string[];
+  gmail_sync_mode?: "all" | "last_n_days" | "max_count" | "query";
+  gmail_last_n_days?: number | null;
+  gmail_max_messages?: number | null;
+  gmail_query?: string | null;
   calendar_enabled: boolean;
   calendar_ids: string[];
+  calendar_sync_mode?: "range_days" | "upcoming_count" | "all";
+  calendar_days_back?: number | null;
+  calendar_days_forward?: number | null;
+  calendar_max_events?: number | null;
+  drive_enabled?: boolean;
+  drive_folder_ids?: string[];
+  drive_file_ids?: string[];
+  sheets_enabled?: boolean;
+  sheets_targets?: Array<Record<string, unknown>>;
+  contacts_enabled?: boolean;
+  contacts_sync_mode?: "all" | "groups" | "max_count";
+  contacts_group_ids?: string[];
+  contacts_max_count?: number | null;
+  meet_enabled?: boolean;
+  crm_sheet_spreadsheet_id?: string | null;
+  crm_sheet_tab_name?: string | null;
+  sync_scope_configured?: boolean;
 };
 
 export type GoogleAccountRead = {
@@ -91,11 +113,33 @@ export type GoogleAccountRead = {
   google_account_sub: string | null;
   is_oauth_connected: boolean;
   is_primary: boolean;
+  is_workspace_default: boolean;
   scopes: string[];
   gmail_enabled: boolean;
   gmail_labels: string[];
+  gmail_sync_mode: string;
+  gmail_last_n_days: number | null;
+  gmail_max_messages: number | null;
+  gmail_query: string | null;
   calendar_enabled: boolean;
   calendar_ids: string[];
+  calendar_sync_mode: string;
+  calendar_days_back: number | null;
+  calendar_days_forward: number | null;
+  calendar_max_events: number | null;
+  drive_enabled: boolean;
+  drive_folder_ids: string[];
+  drive_file_ids: string[];
+  sheets_enabled: boolean;
+  sheets_targets: Array<Record<string, unknown>>;
+  contacts_enabled: boolean;
+  contacts_sync_mode: string;
+  contacts_group_ids: string[];
+  contacts_max_count: number | null;
+  meet_enabled: boolean;
+  crm_sheet_spreadsheet_id: string | null;
+  crm_sheet_tab_name: string | null;
+  sync_scope_configured: boolean;
   status: {
     enabled: boolean;
     last_sync_at: string | null;
@@ -220,6 +264,72 @@ export function googleStatus(accountId: string) {
 export function googleListCalendars(accountId: string) {
   return request<GoogleCalendarListItem[]>(
     `/api/v1/connectors/google/accounts/${encodeURIComponent(accountId)}/calendars`
+  );
+}
+
+export function getGoogleSyncOptions(accountId: string) {
+  return request<{
+    sync_scope_configured: boolean;
+    gmail_sync_mode: string;
+    gmail_last_n_days: number | null;
+    gmail_max_messages: number | null;
+    gmail_query: string | null;
+    calendar_sync_mode: string;
+    calendar_days_back: number | null;
+    calendar_days_forward: number | null;
+    calendar_max_events: number | null;
+    drive_enabled: boolean;
+    drive_folder_ids: string[];
+    drive_file_ids: string[];
+    sheets_enabled: boolean;
+    sheets_targets: Array<Record<string, unknown>>;
+    contacts_enabled: boolean;
+    contacts_sync_mode: string;
+    contacts_group_ids: string[];
+    contacts_max_count: number | null;
+    validation: Record<string, Record<string, number>>;
+  }>(`/api/v1/connectors/google/accounts/${encodeURIComponent(accountId)}/sync-options`);
+}
+
+export function updateGoogleSyncOptions(accountId: string, payload: Partial<GoogleAccountPayload>) {
+  return request<GoogleAccountRead>(`/api/v1/connectors/google/accounts/${encodeURIComponent(accountId)}/sync-options`, {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function googleListDriveFolders(accountId: string) {
+  return request<Array<{ id: string; name: string }>>(
+    `/api/v1/connectors/google/accounts/${encodeURIComponent(accountId)}/drive/folders`
+  );
+}
+
+export function googleListDriveFiles(accountId: string, folderId?: string, q?: string) {
+  const params = new URLSearchParams();
+  if (folderId) params.set("folder_id", folderId);
+  if (q) params.set("q", q);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request<Array<{ id: string; name: string; mime_type?: string | null }>>(
+    `/api/v1/connectors/google/accounts/${encodeURIComponent(accountId)}/drive/files${suffix}`
+  );
+}
+
+export function googleListSpreadsheets(accountId: string, q?: string) {
+  const suffix = q ? `?q=${encodeURIComponent(q)}` : "";
+  return request<Array<{ spreadsheet_id: string; title: string }>>(
+    `/api/v1/connectors/google/accounts/${encodeURIComponent(accountId)}/sheets/spreadsheets${suffix}`
+  );
+}
+
+export function googleListSheetTabs(accountId: string, spreadsheetId: string) {
+  return request<Array<{ title: string; sheet_id?: number | null }>>(
+    `/api/v1/connectors/google/accounts/${encodeURIComponent(accountId)}/sheets/${encodeURIComponent(spreadsheetId)}/tabs`
+  );
+}
+
+export function googleListContactGroups(accountId: string) {
+  return request<Array<{ resource_name: string; name: string }>>(
+    `/api/v1/connectors/google/accounts/${encodeURIComponent(accountId)}/contacts/groups`
   );
 }
 

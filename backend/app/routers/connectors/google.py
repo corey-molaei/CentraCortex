@@ -16,6 +16,12 @@ from app.schemas.connectors.google import (
     GoogleCalendarEventRead,
     GoogleCalendarEventUpsert,
     GoogleCalendarListItem,
+    GoogleContactGroupItem,
+    GoogleDriveFileItem,
+    GoogleDriveFolderItem,
+    GoogleSheetItem,
+    GoogleSheetTabItem,
+    GoogleSyncOptionsUpdate,
 )
 from app.services.audit import audit_event
 from app.services.connectors.common import connector_status_payload
@@ -26,6 +32,12 @@ from app.services.connectors.google_service import (
     disconnect_account,
     get_oauth_url,
     list_calendars,
+    list_contact_groups,
+    list_drive_files,
+    list_drive_folders,
+    list_sheet_tabs,
+    list_sheets_spreadsheets,
+    set_workspace_default_account,
     sync_connector,
     test_connection,
     update_event,
@@ -56,11 +68,33 @@ def _read_model(connector: GoogleUserConnector) -> GoogleAccountRead:
         google_account_sub=connector.google_account_sub,
         is_oauth_connected=bool(connector.access_token_encrypted),
         is_primary=connector.is_primary,
+        is_workspace_default=connector.is_workspace_default,
         scopes=connector.scopes,
         gmail_enabled=connector.gmail_enabled,
         gmail_labels=connector.gmail_labels,
+        gmail_sync_mode=connector.gmail_sync_mode,
+        gmail_last_n_days=connector.gmail_last_n_days,
+        gmail_max_messages=connector.gmail_max_messages,
+        gmail_query=connector.gmail_query,
         calendar_enabled=connector.calendar_enabled,
         calendar_ids=connector.calendar_ids,
+        calendar_sync_mode=connector.calendar_sync_mode,
+        calendar_days_back=connector.calendar_days_back,
+        calendar_days_forward=connector.calendar_days_forward,
+        calendar_max_events=connector.calendar_max_events,
+        drive_enabled=connector.drive_enabled,
+        drive_folder_ids=connector.drive_folder_ids,
+        drive_file_ids=connector.drive_file_ids,
+        sheets_enabled=connector.sheets_enabled,
+        sheets_targets=connector.sheets_targets,
+        contacts_enabled=connector.contacts_enabled,
+        contacts_sync_mode=connector.contacts_sync_mode,
+        contacts_group_ids=connector.contacts_group_ids,
+        contacts_max_count=connector.contacts_max_count,
+        meet_enabled=connector.meet_enabled,
+        crm_sheet_spreadsheet_id=connector.crm_sheet_spreadsheet_id,
+        crm_sheet_tab_name=connector.crm_sheet_tab_name,
+        sync_scope_configured=connector.sync_scope_configured,
         status=ConnectorStatus(**connector_status_payload(connector)),
     )
 
@@ -76,6 +110,21 @@ def _get_owned_account(db: Session, membership: TenantMembership, account_id: st
     if connector is None:
         raise HTTPException(status_code=404, detail="Google account not found")
     return connector
+
+
+def _validate_sync_options(payload: GoogleSyncOptionsUpdate) -> None:
+    if payload.gmail_last_n_days is not None and not (1 <= payload.gmail_last_n_days <= 3650):
+        raise HTTPException(status_code=400, detail="gmail_last_n_days must be between 1 and 3650")
+    if payload.gmail_max_messages is not None and not (1 <= payload.gmail_max_messages <= 5000):
+        raise HTTPException(status_code=400, detail="gmail_max_messages must be between 1 and 5000")
+    if payload.calendar_days_back is not None and not (0 <= payload.calendar_days_back <= 3650):
+        raise HTTPException(status_code=400, detail="calendar_days_back must be between 0 and 3650")
+    if payload.calendar_days_forward is not None and not (1 <= payload.calendar_days_forward <= 3650):
+        raise HTTPException(status_code=400, detail="calendar_days_forward must be between 1 and 3650")
+    if payload.calendar_max_events is not None and not (1 <= payload.calendar_max_events <= 5000):
+        raise HTTPException(status_code=400, detail="calendar_max_events must be between 1 and 5000")
+    if payload.contacts_max_count is not None and not (1 <= payload.contacts_max_count <= 5000):
+        raise HTTPException(status_code=400, detail="contacts_max_count must be between 1 and 5000")
 
 
 @router.get("/config")
@@ -118,19 +167,50 @@ def create_google_account(
         )
     ).scalar_one_or_none()
 
+    existing_workspace_default = db.execute(
+        select(GoogleUserConnector.id).where(
+            GoogleUserConnector.tenant_id == membership.tenant_id,
+            GoogleUserConnector.is_workspace_default.is_(True),
+        )
+    ).scalar_one_or_none()
+
     account = GoogleUserConnector(
         tenant_id=membership.tenant_id,
         user_id=membership.user_id,
         label=payload.label,
         enabled=payload.enabled,
         is_primary=existing_primary is None,
+        is_workspace_default=payload.is_workspace_default or existing_workspace_default is None,
         gmail_enabled=payload.gmail_enabled,
         gmail_labels=payload.gmail_labels,
+        gmail_sync_mode=payload.gmail_sync_mode,
+        gmail_last_n_days=payload.gmail_last_n_days,
+        gmail_max_messages=payload.gmail_max_messages,
+        gmail_query=payload.gmail_query,
         calendar_enabled=payload.calendar_enabled,
         calendar_ids=payload.calendar_ids,
+        calendar_sync_mode=payload.calendar_sync_mode,
+        calendar_days_back=payload.calendar_days_back,
+        calendar_days_forward=payload.calendar_days_forward,
+        calendar_max_events=payload.calendar_max_events,
+        drive_enabled=payload.drive_enabled,
+        drive_folder_ids=payload.drive_folder_ids,
+        drive_file_ids=payload.drive_file_ids,
+        sheets_enabled=payload.sheets_enabled,
+        sheets_targets=payload.sheets_targets,
+        contacts_enabled=payload.contacts_enabled,
+        contacts_sync_mode=payload.contacts_sync_mode,
+        contacts_group_ids=payload.contacts_group_ids,
+        contacts_max_count=payload.contacts_max_count,
+        meet_enabled=payload.meet_enabled,
+        crm_sheet_spreadsheet_id=payload.crm_sheet_spreadsheet_id,
+        crm_sheet_tab_name=payload.crm_sheet_tab_name,
+        sync_scope_configured=payload.sync_scope_configured,
     )
     db.add(account)
     db.commit()
+    if account.is_workspace_default:
+        set_workspace_default_account(db, tenant_id=membership.tenant_id, account_id=account.id)
     db.refresh(account)
     return _read_model(account)
 
@@ -146,6 +226,7 @@ def update_google_account(
 
     updates = payload.model_dump(exclude_unset=True)
     set_primary = updates.pop("is_primary", None)
+    set_workspace_default = updates.pop("is_workspace_default", None)
     for key, value in updates.items():
         setattr(account, key, value)
 
@@ -174,6 +255,18 @@ def update_google_account(
         replacement.is_primary = True
 
     db.commit()
+    if set_workspace_default is True:
+        set_workspace_default_account(db, tenant_id=membership.tenant_id, account_id=account.id)
+    elif set_workspace_default is False and account.is_workspace_default:
+        replacement = db.execute(
+            select(GoogleUserConnector).where(
+                GoogleUserConnector.tenant_id == membership.tenant_id,
+                GoogleUserConnector.id != account.id,
+            )
+        ).scalars().first()
+        if replacement is None:
+            raise HTTPException(status_code=400, detail="At least one workspace-default Google account is required")
+        set_workspace_default_account(db, tenant_id=membership.tenant_id, account_id=replacement.id)
     db.refresh(account)
     return _read_model(account)
 
@@ -187,6 +280,7 @@ def delete_google_account(
 ):
     account = _get_owned_account(db, membership, account_id)
     was_primary = account.is_primary
+    was_workspace_default = account.is_workspace_default
     deleted_docs_count = disconnect_account(db, account)
 
     if was_primary:
@@ -199,6 +293,15 @@ def delete_google_account(
         if replacement and not replacement.is_primary:
             replacement.is_primary = True
             db.commit()
+
+    if was_workspace_default:
+        replacement_workspace = db.execute(
+            select(GoogleUserConnector).where(
+                GoogleUserConnector.tenant_id == membership.tenant_id,
+            ).order_by(GoogleUserConnector.created_at.asc())
+        ).scalars().first()
+        if replacement_workspace:
+            set_workspace_default_account(db, tenant_id=membership.tenant_id, account_id=replacement_workspace.id)
 
     audit_event(
         db,
@@ -313,7 +416,7 @@ def sync_google(
     account = _get_owned_account(db, membership, account_id)
 
     try:
-        total, gmail_count, calendar_count = sync_connector(
+        counts = sync_connector(
             db,
             account,
             client_id=client_id,
@@ -334,7 +437,7 @@ def sync_google(
         payload={
             "account_id": account.id,
             "google_account_email": account.google_account_email,
-            "items_synced": gmail_count,
+            "items_synced": counts["gmail"],
         },
     )
     audit_event(
@@ -349,11 +452,99 @@ def sync_google(
         payload={
             "account_id": account.id,
             "google_account_email": account.google_account_email,
-            "items_synced": calendar_count,
+            "items_synced": counts["calendar"],
         },
     )
+    audit_event(
+        db,
+        event_type="google.sync.drive",
+        resource_type="google_connector_account",
+        action="sync",
+        tenant_id=membership.tenant_id,
+        user_id=membership.user_id,
+        resource_id=account.id,
+        request_id=request.headers.get("X-Request-ID"),
+        payload={"account_id": account.id, "google_account_email": account.google_account_email, "items_synced": counts["drive"]},
+    )
+    audit_event(
+        db,
+        event_type="google.sync.sheets",
+        resource_type="google_connector_account",
+        action="sync",
+        tenant_id=membership.tenant_id,
+        user_id=membership.user_id,
+        resource_id=account.id,
+        request_id=request.headers.get("X-Request-ID"),
+        payload={"account_id": account.id, "google_account_email": account.google_account_email, "items_synced": counts["sheets"]},
+    )
+    audit_event(
+        db,
+        event_type="google.sync.contacts",
+        resource_type="google_connector_account",
+        action="sync",
+        tenant_id=membership.tenant_id,
+        user_id=membership.user_id,
+        resource_id=account.id,
+        request_id=request.headers.get("X-Request-ID"),
+        payload={"account_id": account.id, "google_account_email": account.google_account_email, "items_synced": counts["contacts"]},
+    )
 
-    return SyncResponse(status="success", items_synced=total, message="Google sync completed")
+    return SyncResponse(status="success", items_synced=counts["total"], message="Google sync completed")
+
+
+@router.get("/accounts/{account_id}/sync-options")
+def get_google_sync_options(
+    account_id: str,
+    membership: TenantMembership = Depends(get_current_tenant_membership),
+    db: Session = Depends(get_db),
+):
+    account = _get_owned_account(db, membership, account_id)
+    return {
+        "sync_scope_configured": account.sync_scope_configured,
+        "gmail_sync_mode": account.gmail_sync_mode,
+        "gmail_last_n_days": account.gmail_last_n_days,
+        "gmail_max_messages": account.gmail_max_messages,
+        "gmail_query": account.gmail_query,
+        "calendar_sync_mode": account.calendar_sync_mode,
+        "calendar_days_back": account.calendar_days_back,
+        "calendar_days_forward": account.calendar_days_forward,
+        "calendar_max_events": account.calendar_max_events,
+        "drive_enabled": account.drive_enabled,
+        "drive_folder_ids": account.drive_folder_ids,
+        "drive_file_ids": account.drive_file_ids,
+        "sheets_enabled": account.sheets_enabled,
+        "sheets_targets": account.sheets_targets,
+        "contacts_enabled": account.contacts_enabled,
+        "contacts_sync_mode": account.contacts_sync_mode,
+        "contacts_group_ids": account.contacts_group_ids,
+        "contacts_max_count": account.contacts_max_count,
+        "validation": {
+            "gmail_last_n_days": {"min": 1, "max": 3650},
+            "gmail_max_messages": {"min": 1, "max": 5000},
+            "calendar_days_back": {"min": 0, "max": 3650},
+            "calendar_days_forward": {"min": 1, "max": 3650},
+            "calendar_max_events": {"min": 1, "max": 5000},
+            "contacts_max_count": {"min": 1, "max": 5000},
+        },
+    }
+
+
+@router.put("/accounts/{account_id}/sync-options", response_model=GoogleAccountRead)
+def update_google_sync_options(
+    account_id: str,
+    payload: GoogleSyncOptionsUpdate,
+    membership: TenantMembership = Depends(get_current_tenant_membership),
+    db: Session = Depends(get_db),
+):
+    _validate_sync_options(payload)
+    account = _get_owned_account(db, membership, account_id)
+    updates = payload.model_dump(exclude_unset=True)
+    for key, value in updates.items():
+        setattr(account, key, value)
+    account.sync_scope_configured = True
+    db.commit()
+    db.refresh(account)
+    return _read_model(account)
 
 
 @router.get("/accounts/{account_id}/status", response_model=list[SyncRunRead])
@@ -411,6 +602,109 @@ def google_list_calendars(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return [GoogleCalendarListItem(**item) for item in calendars]
+
+
+@router.get("/accounts/{account_id}/drive/folders", response_model=list[GoogleDriveFolderItem])
+def google_list_drive_folders(
+    account_id: str,
+    membership: TenantMembership = Depends(get_current_tenant_membership),
+    db: Session = Depends(get_db),
+):
+    client_id, client_secret = _ensure_oauth_settings()
+    account = _get_owned_account(db, membership, account_id)
+    try:
+        rows = list_drive_folders(db, account, client_id=client_id, client_secret=client_secret)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return [GoogleDriveFolderItem(**item) for item in rows]
+
+
+@router.get("/accounts/{account_id}/drive/files", response_model=list[GoogleDriveFileItem])
+def google_list_drive_files(
+    account_id: str,
+    folder_id: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    membership: TenantMembership = Depends(get_current_tenant_membership),
+    db: Session = Depends(get_db),
+):
+    client_id, client_secret = _ensure_oauth_settings()
+    account = _get_owned_account(db, membership, account_id)
+    try:
+        rows = list_drive_files(
+            db,
+            account,
+            client_id=client_id,
+            client_secret=client_secret,
+            folder_id=folder_id,
+            query=q,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return [GoogleDriveFileItem(**item) for item in rows]
+
+
+@router.get("/accounts/{account_id}/sheets/spreadsheets", response_model=list[GoogleSheetItem])
+def google_list_sheets_spreadsheets(
+    account_id: str,
+    q: str | None = Query(default=None),
+    membership: TenantMembership = Depends(get_current_tenant_membership),
+    db: Session = Depends(get_db),
+):
+    client_id, client_secret = _ensure_oauth_settings()
+    account = _get_owned_account(db, membership, account_id)
+    try:
+        rows = list_sheets_spreadsheets(
+            db,
+            account,
+            client_id=client_id,
+            client_secret=client_secret,
+            query=q,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return [GoogleSheetItem(**item) for item in rows]
+
+
+@router.get("/accounts/{account_id}/sheets/{spreadsheet_id}/tabs", response_model=list[GoogleSheetTabItem])
+def google_list_sheet_tabs(
+    account_id: str,
+    spreadsheet_id: str,
+    membership: TenantMembership = Depends(get_current_tenant_membership),
+    db: Session = Depends(get_db),
+):
+    client_id, client_secret = _ensure_oauth_settings()
+    account = _get_owned_account(db, membership, account_id)
+    try:
+        rows = list_sheet_tabs(
+            db,
+            account,
+            client_id=client_id,
+            client_secret=client_secret,
+            spreadsheet_id=spreadsheet_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return [GoogleSheetTabItem(**item) for item in rows]
+
+
+@router.get("/accounts/{account_id}/contacts/groups", response_model=list[GoogleContactGroupItem])
+def google_list_contacts_groups(
+    account_id: str,
+    membership: TenantMembership = Depends(get_current_tenant_membership),
+    db: Session = Depends(get_db),
+):
+    client_id, client_secret = _ensure_oauth_settings()
+    account = _get_owned_account(db, membership, account_id)
+    try:
+        rows = list_contact_groups(
+            db,
+            account,
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return [GoogleContactGroupItem(**item) for item in rows]
 
 
 @router.post("/accounts/{account_id}/calendar/events", response_model=GoogleCalendarEventRead)

@@ -6,12 +6,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.models.connectors.google_user_connector import GoogleUserConnector
 from app.models.conversation_contact_link import ConversationContactLink
 from app.models.workspace_contact import WorkspaceContact
-from app.models.workspace_google_integration import WorkspaceGoogleIntegration
 from app.services.audit import audit_event
 from app.services.chat_runtime import run_chat_v2
-from app.services.connectors.google_workspace_service import append_crm_row
+from app.services.connectors.google_service import append_crm_row
 
 
 def resolve_contact(
@@ -110,11 +110,12 @@ def run_channel_message(
     )
 
     integration = db.execute(
-        select(WorkspaceGoogleIntegration).where(
-            WorkspaceGoogleIntegration.tenant_id == tenant_id,
-            WorkspaceGoogleIntegration.enabled.is_(True),
-            WorkspaceGoogleIntegration.sheets_enabled.is_(True),
-            WorkspaceGoogleIntegration.crm_sheet_spreadsheet_id.is_not(None),
+        select(GoogleUserConnector).where(
+            GoogleUserConnector.tenant_id == tenant_id,
+            GoogleUserConnector.is_workspace_default.is_(True),
+            GoogleUserConnector.enabled.is_(True),
+            GoogleUserConnector.sheets_enabled.is_(True),
+            GoogleUserConnector.crm_sheet_spreadsheet_id.is_not(None),
         )
     ).scalar_one_or_none()
     if integration and settings.google_client_id and settings.google_client_secret:
@@ -140,7 +141,7 @@ def run_channel_message(
             audit_event(
                 db,
                 event_type="channel.crm_log_failed",
-                resource_type="workspace_google_integration",
+                resource_type="google_connector_account",
                 action="append_row",
                 tenant_id=tenant_id,
                 user_id=user_id,

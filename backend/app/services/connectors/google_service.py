@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlencode
@@ -23,6 +24,9 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 GOOGLE_GMAIL_BASE_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
 GOOGLE_CALENDAR_BASE_URL = "https://www.googleapis.com/calendar/v3"
+GOOGLE_DRIVE_BASE_URL = "https://www.googleapis.com/drive/v3"
+GOOGLE_SHEETS_BASE_URL = "https://sheets.googleapis.com/v4/spreadsheets"
+GOOGLE_PEOPLE_BASE_URL = "https://people.googleapis.com/v1"
 
 
 def _utcnow() -> datetime:
@@ -142,8 +146,22 @@ def _google_request(
         raise ValueError("Google API returned a non-JSON response") from exc
 
 
+def _google_text_request(*, access_token: str, url: str, params: dict | None = None) -> str:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    with httpx.Client(timeout=30) as client:
+        response = client.get(url, headers=headers, params=params)
+    if response.status_code >= 400:
+        raise ValueError(f"Google API text request failed: {response.text}")
+    return response.text
+
+
 def _exchange_token(data: dict[str, str]) -> dict:
     return _google_request(method="POST", url=GOOGLE_TOKEN_URL, data=data)
+
+
+def _selector_key(parts: list[str]) -> str:
+    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()  # noqa: S324
+    return digest[:16]
 
 
 def _account_resource_id(account_id: str) -> str:
@@ -380,6 +398,51 @@ def list_user_accounts(
     return accounts
 
 
+def get_workspace_default_account(db: Session, *, tenant_id: str) -> GoogleUserConnector | None:
+    account = db.execute(
+        select(GoogleUserConnector).where(
+            GoogleUserConnector.tenant_id == tenant_id,
+            GoogleUserConnector.is_workspace_default.is_(True),
+        )
+    ).scalars().first()
+    if account:
+        return account
+    return db.execute(
+        select(GoogleUserConnector)
+        .where(
+            GoogleUserConnector.tenant_id == tenant_id,
+            GoogleUserConnector.access_token_encrypted.is_not(None),
+            GoogleUserConnector.enabled.is_(True),
+        )
+        .order_by(GoogleUserConnector.is_primary.desc(), GoogleUserConnector.created_at.asc())
+    ).scalars().first()
+
+
+def set_workspace_default_account(db: Session, *, tenant_id: str, account_id: str) -> GoogleUserConnector:
+    account = db.execute(
+        select(GoogleUserConnector).where(
+            GoogleUserConnector.id == account_id,
+            GoogleUserConnector.tenant_id == tenant_id,
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        raise ValueError("Google account not found")
+
+    others = db.execute(
+        select(GoogleUserConnector).where(
+            GoogleUserConnector.tenant_id == tenant_id,
+            GoogleUserConnector.id != account.id,
+            GoogleUserConnector.is_workspace_default.is_(True),
+        )
+    ).scalars().all()
+    for other in others:
+        other.is_workspace_default = False
+    account.is_workspace_default = True
+    db.commit()
+    db.refresh(account)
+    return account
+
+
 def list_gmail_messages(
     db: Session,
     connector: GoogleUserConnector,
@@ -535,9 +598,21 @@ def sync_gmail(db: Session, connector: GoogleUserConnector, *, access_token: str
     total = 0
 
     acl_policy_id = ensure_private_acl_policy(db, connector)
+    sync_mode = str(connector.gmail_sync_mode or "last_n_days").strip().lower()
+    cursor_key = _selector_key(
+        [
+            sync_mode,
+            ",".join(sorted(connector.gmail_labels or [])),
+            str(connector.gmail_last_n_days or ""),
+            str(connector.gmail_max_messages or ""),
+            str(connector.gmail_query or ""),
+        ]
+    )
+    selector_cursor = dict(gmail_cursor.get(cursor_key, {}))
+    hard_cap = max(1, min(int(connector.gmail_max_messages or 5000), 5000))
 
     for label in connector.gmail_labels:
-        label_cursor = dict(gmail_cursor.get(label, {}))
+        label_cursor = dict(selector_cursor.get(label, {}))
         max_internal_ms = int(label_cursor.get("internal_ms", 0))
         page_token: str | None = None
 
@@ -546,8 +621,15 @@ def sync_gmail(db: Session, connector: GoogleUserConnector, *, access_token: str
                 "maxResults": 100,
                 "labelIds": label,
             }
-            if max_internal_ms > 0:
-                params["q"] = f"after:{max_internal_ms // 1000}"
+            query_parts: list[str] = []
+            if sync_mode == "last_n_days" and connector.gmail_last_n_days:
+                query_parts.append(f"newer_than:{max(1, int(connector.gmail_last_n_days))}d")
+            elif sync_mode == "query" and connector.gmail_query:
+                query_parts.append(str(connector.gmail_query).strip())
+            elif max_internal_ms > 0 and sync_mode == "all":
+                query_parts.append(f"after:{max_internal_ms // 1000}")
+            if query_parts:
+                params["q"] = " ".join(query_parts)
             if page_token:
                 params["pageToken"] = page_token
 
@@ -611,15 +693,22 @@ def sync_gmail(db: Session, connector: GoogleUserConnector, *, access_token: str
                 )
                 processed_message_ids.add(message_id)
                 total += 1
+                if total >= hard_cap:
+                    break
 
+            if total >= hard_cap:
+                break
             page_token = page.get("nextPageToken")
             if not page_token:
                 break
 
-        gmail_cursor[label] = {
+        selector_cursor[label] = {
             "internal_ms": str(max_internal_ms),
         }
+        if total >= hard_cap:
+            break
 
+    gmail_cursor[cursor_key] = selector_cursor
     cursor["gmail"] = gmail_cursor
     connector.sync_cursor = cursor
     return total
@@ -632,8 +721,31 @@ def sync_calendar(db: Session, connector: GoogleUserConnector, *, access_token: 
 
     acl_policy_id = ensure_private_acl_policy(db, connector)
 
+    sync_mode = str(connector.calendar_sync_mode or "range_days").strip().lower()
+    cursor_key = _selector_key(
+        [
+            sync_mode,
+            ",".join(sorted(connector.calendar_ids or [])),
+            str(connector.calendar_days_back or ""),
+            str(connector.calendar_days_forward or ""),
+            str(connector.calendar_max_events or ""),
+        ]
+    )
+    scoped_cursor = dict(calendar_cursor.get(cursor_key, {}))
+    max_events_cap = max(1, min(int(connector.calendar_max_events or 5000), 5000))
+    now_utc = _utcnow()
+    time_min_iso: str | None = None
+    time_max_iso: str | None = None
+    if sync_mode == "range_days":
+        back = max(0, int(connector.calendar_days_back or 30))
+        forward = max(1, int(connector.calendar_days_forward or 90))
+        time_min_iso = (now_utc - timedelta(days=back)).isoformat()
+        time_max_iso = (now_utc + timedelta(days=forward)).isoformat()
+    elif sync_mode == "upcoming_count":
+        time_min_iso = now_utc.isoformat()
+
     for calendar_id in connector.calendar_ids:
-        max_updated = str(calendar_cursor.get(calendar_id) or "")
+        max_updated = str(scoped_cursor.get(calendar_id) or "")
         page_token: str | None = None
 
         while True:
@@ -642,8 +754,15 @@ def sync_calendar(db: Session, connector: GoogleUserConnector, *, access_token: 
                 "singleEvents": "true",
                 "showDeleted": "true",
             }
-            if max_updated:
+            if max_updated and sync_mode == "all":
                 params["updatedMin"] = max_updated
+            if time_min_iso:
+                params["timeMin"] = time_min_iso
+            if time_max_iso:
+                params["timeMax"] = time_max_iso
+            if sync_mode == "upcoming_count":
+                params["orderBy"] = "startTime"
+                params["maxResults"] = min(max_events_cap, 250)
             if page_token:
                 params["pageToken"] = page_token
 
@@ -710,17 +829,438 @@ def sync_calendar(db: Session, connector: GoogleUserConnector, *, access_token: 
                     },
                 )
                 total += 1
+                if total >= max_events_cap:
+                    break
 
+            if total >= max_events_cap:
+                break
             page_token = payload.get("nextPageToken")
             if not page_token:
                 break
 
         if max_updated:
-            calendar_cursor[calendar_id] = max_updated
+            scoped_cursor[calendar_id] = max_updated
+        if total >= max_events_cap:
+            break
 
+    calendar_cursor[cursor_key] = scoped_cursor
     cursor["calendar"] = calendar_cursor
     connector.sync_cursor = cursor
     return total
+
+
+def sync_drive(db: Session, connector: GoogleUserConnector, *, access_token: str) -> int:
+    if not connector.drive_enabled:
+        return 0
+    selected_folders = [str(item).strip() for item in (connector.drive_folder_ids or []) if str(item).strip()]
+    selected_files = [str(item).strip() for item in (connector.drive_file_ids or []) if str(item).strip()]
+    if not selected_folders and not selected_files:
+        return 0
+
+    acl_policy_id = ensure_private_acl_policy(db, connector)
+    seen_file_ids: set[str] = set()
+    total = 0
+
+    for folder_id in selected_folders:
+        query = f"'{folder_id}' in parents and trashed=false"
+        page_token: str | None = None
+        while True:
+            payload = _google_request(
+                method="GET",
+                access_token=access_token,
+                url=f"{GOOGLE_DRIVE_BASE_URL}/files",
+                params={
+                    "q": query,
+                    "pageSize": 100,
+                    "fields": "nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink,owners(emailAddress))",
+                    **({"pageToken": page_token} if page_token else {}),
+                },
+            )
+            for item in payload.get("files", []):
+                file_id = str(item.get("id") or "")
+                if not file_id or file_id in seen_file_ids:
+                    continue
+                seen_file_ids.add(file_id)
+                total += _upsert_drive_document(
+                    db,
+                    connector=connector,
+                    acl_policy_id=acl_policy_id,
+                    access_token=access_token,
+                    file_id=file_id,
+                    item=item,
+                )
+            page_token = payload.get("nextPageToken")
+            if not page_token:
+                break
+
+    for file_id in selected_files:
+        if file_id in seen_file_ids:
+            continue
+        item = _google_request(
+            method="GET",
+            access_token=access_token,
+            url=f"{GOOGLE_DRIVE_BASE_URL}/files/{quote(file_id, safe='')}",
+            params={"fields": "id,name,mimeType,modifiedTime,webViewLink,owners(emailAddress)"},
+        )
+        seen_file_ids.add(file_id)
+        total += _upsert_drive_document(
+            db,
+            connector=connector,
+            acl_policy_id=acl_policy_id,
+            access_token=access_token,
+            file_id=file_id,
+            item=item,
+        )
+
+    return total
+
+
+def _upsert_drive_document(
+    db: Session,
+    *,
+    connector: GoogleUserConnector,
+    acl_policy_id: str,
+    access_token: str,
+    file_id: str,
+    item: dict,
+) -> int:
+    name = str(item.get("name") or file_id)
+    mime_type = str(item.get("mimeType") or "")
+    modified_time = str(item.get("modifiedTime") or "")
+    source_updated_at = _parse_google_datetime(modified_time)
+
+    raw_text = f"Drive file: {name}"
+    if mime_type == "application/vnd.google-apps.document":
+        try:
+            raw_text = _google_text_request(
+                access_token=access_token,
+                url=f"{GOOGLE_DRIVE_BASE_URL}/files/{quote(file_id, safe='')}/export",
+                params={"mimeType": "text/plain"},
+            )
+        except Exception:
+            pass
+
+    owner_email = None
+    owners = item.get("owners") or []
+    if owners:
+        owner_email = (owners[0] or {}).get("emailAddress")
+    upsert_document(
+        db,
+        tenant_id=connector.tenant_id,
+        source_type="google_drive",
+        source_id=f"{connector.id}:drive:{file_id}",
+        url=item.get("webViewLink"),
+        title=name,
+        author=owner_email or connector.google_account_email,
+        source_created_at=source_updated_at,
+        source_updated_at=source_updated_at,
+        raw_text=raw_text,
+        acl_policy_id=acl_policy_id,
+        metadata_json={
+            "google_connector_account_id": connector.id,
+            "google_account_email": connector.google_account_email,
+            "google_account_sub": connector.google_account_sub,
+            "file_id": file_id,
+            "mime_type": mime_type,
+        },
+    )
+    return 1
+
+
+def sync_sheets(db: Session, connector: GoogleUserConnector, *, access_token: str) -> int:
+    if not connector.sheets_enabled:
+        return 0
+    acl_policy_id = ensure_private_acl_policy(db, connector)
+    total = 0
+    for target in connector.sheets_targets or []:
+        if not target or target.get("enabled") is False:
+            continue
+        spreadsheet_id = str(target.get("spreadsheet_id") or "").strip()
+        if not spreadsheet_id:
+            continue
+        target_range = str(target.get("range") or "A:Z").strip() or "A:Z"
+        tab_name = str(target.get("tab") or "").strip()
+        read_range = f"{tab_name}!{target_range}" if tab_name else target_range
+        payload = _google_request(
+            method="GET",
+            access_token=access_token,
+            url=f"{GOOGLE_SHEETS_BASE_URL}/{quote(spreadsheet_id, safe='')}/values/{quote(read_range, safe='!:$')}",
+        )
+        values = payload.get("values") or []
+        if not values:
+            continue
+        raw_text = "\n".join([", ".join([str(cell) for cell in row]) for row in values])
+        upsert_document(
+            db,
+            tenant_id=connector.tenant_id,
+            source_type="google_sheets",
+            source_id=f"{connector.id}:sheets:{spreadsheet_id}:{tab_name or 'sheet'}:{target_range}",
+            url=f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}",
+            title=f"Sheet {spreadsheet_id} {tab_name or ''} {target_range}".strip(),
+            author=connector.google_account_email,
+            source_created_at=None,
+            source_updated_at=_utcnow(),
+            raw_text=raw_text,
+            acl_policy_id=acl_policy_id,
+            metadata_json={
+                "google_connector_account_id": connector.id,
+                "google_account_email": connector.google_account_email,
+                "google_account_sub": connector.google_account_sub,
+                "spreadsheet_id": spreadsheet_id,
+                "tab": tab_name,
+                "range": target_range,
+            },
+        )
+        total += 1
+    return total
+
+
+def sync_contacts(db: Session, connector: GoogleUserConnector, *, access_token: str) -> int:
+    if not connector.contacts_enabled:
+        return 0
+    acl_policy_id = ensure_private_acl_policy(db, connector)
+    mode = str(connector.contacts_sync_mode or "all").strip().lower()
+    cap = max(1, min(int(connector.contacts_max_count or 1000), 5000))
+    group_ids = [str(group).strip() for group in (connector.contacts_group_ids or []) if str(group).strip()]
+    if mode == "groups" and not group_ids:
+        return 0
+
+    all_people: list[dict] = []
+    if mode == "groups":
+        for group_id in group_ids:
+            page_token: str | None = None
+            while True:
+                payload = _google_request(
+                    method="GET",
+                    access_token=access_token,
+                    url=f"{GOOGLE_PEOPLE_BASE_URL}/{quote(group_id, safe='/')}/members",
+                    params={
+                        "maxMembers": min(cap, 1000),
+                        **({"pageToken": page_token} if page_token else {}),
+                    },
+                )
+                all_people.extend(payload.get("memberResourceNames") or [])
+                if len(all_people) >= cap:
+                    break
+                page_token = payload.get("nextPageToken")
+                if not page_token:
+                    break
+            if len(all_people) >= cap:
+                break
+        unique_resource_names = []
+        seen: set[str] = set()
+        for item in all_people:
+            resource_name = str(item or "").strip()
+            if resource_name and resource_name not in seen:
+                seen.add(resource_name)
+                unique_resource_names.append(resource_name)
+        people_resource_names = unique_resource_names[:cap]
+        people: list[dict] = []
+        for resource_name in people_resource_names:
+            detail = _google_request(
+                method="GET",
+                access_token=access_token,
+                url=f"{GOOGLE_PEOPLE_BASE_URL}/{quote(resource_name, safe='/')}",
+                params={"personFields": "names,emailAddresses,phoneNumbers,organizations,biographies,metadata"},
+            )
+            people.append(detail)
+    else:
+        people = []
+        page_token: str | None = None
+        while True:
+            payload = _google_request(
+                method="GET",
+                access_token=access_token,
+                url=f"{GOOGLE_PEOPLE_BASE_URL}/people/me/connections",
+                params={
+                    "personFields": "names,emailAddresses,phoneNumbers,organizations,biographies,metadata",
+                    "pageSize": min(cap, 1000),
+                    **({"pageToken": page_token} if page_token else {}),
+                },
+            )
+            people.extend(payload.get("connections") or [])
+            if len(people) >= cap:
+                break
+            page_token = payload.get("nextPageToken")
+            if not page_token:
+                break
+        people = people[:cap]
+
+    total = 0
+    for person in people:
+        resource_name = str(person.get("resourceName") or "")
+        if not resource_name:
+            continue
+        names = person.get("names") or []
+        emails = person.get("emailAddresses") or []
+        phones = person.get("phoneNumbers") or []
+        orgs = person.get("organizations") or []
+        display_name = str((names[0] or {}).get("displayName") or resource_name)
+        email_value = str((emails[0] or {}).get("value") or "")
+        phone_value = str((phones[0] or {}).get("value") or "")
+        org_value = str((orgs[0] or {}).get("name") or "")
+        raw_text_lines = [
+            display_name,
+            f"Email: {email_value}" if email_value else "",
+            f"Phone: {phone_value}" if phone_value else "",
+            f"Organization: {org_value}" if org_value else "",
+        ]
+        raw_text = "\n".join([line for line in raw_text_lines if line])
+        upsert_document(
+            db,
+            tenant_id=connector.tenant_id,
+            source_type="google_contacts",
+            source_id=f"{connector.id}:contacts:{resource_name}",
+            url=None,
+            title=display_name,
+            author=connector.google_account_email,
+            source_created_at=None,
+            source_updated_at=_utcnow(),
+            raw_text=raw_text,
+            acl_policy_id=acl_policy_id,
+            metadata_json={
+                "google_connector_account_id": connector.id,
+                "google_account_email": connector.google_account_email,
+                "google_account_sub": connector.google_account_sub,
+                "resource_name": resource_name,
+                "email": email_value,
+                "phone": phone_value,
+                "organization": org_value,
+            },
+        )
+        total += 1
+    return total
+
+
+def list_drive_folders(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    limit: int = 100,
+) -> list[dict]:
+    access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
+    payload = _google_request(
+        method="GET",
+        access_token=access_token,
+        url=f"{GOOGLE_DRIVE_BASE_URL}/files",
+        params={
+            "q": "mimeType='application/vnd.google-apps.folder' and trashed=false",
+            "pageSize": max(1, min(limit, 200)),
+            "fields": "files(id,name)",
+        },
+    )
+    return [{"id": str(item.get("id") or ""), "name": str(item.get("name") or "")} for item in payload.get("files", [])]
+
+
+def list_drive_files(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    folder_id: str | None = None,
+    query: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
+    parts = ["trashed=false"]
+    if folder_id:
+        parts.append(f"'{folder_id}' in parents")
+    if query:
+        escaped = str(query).replace("'", "\\'")
+        parts.append(f"name contains '{escaped}'")
+    q = " and ".join(parts)
+    payload = _google_request(
+        method="GET",
+        access_token=access_token,
+        url=f"{GOOGLE_DRIVE_BASE_URL}/files",
+        params={
+            "q": q,
+            "pageSize": max(1, min(limit, 200)),
+            "fields": "files(id,name,mimeType)",
+        },
+    )
+    return [
+        {"id": str(item.get("id") or ""), "name": str(item.get("name") or ""), "mime_type": item.get("mimeType")}
+        for item in payload.get("files", [])
+    ]
+
+
+def list_sheets_spreadsheets(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    query: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
+    parts = ["mimeType='application/vnd.google-apps.spreadsheet'", "trashed=false"]
+    if query:
+        escaped = str(query).replace("'", "\\'")
+        parts.append(f"name contains '{escaped}'")
+    payload = _google_request(
+        method="GET",
+        access_token=access_token,
+        url=f"{GOOGLE_DRIVE_BASE_URL}/files",
+        params={
+            "q": " and ".join(parts),
+            "pageSize": max(1, min(limit, 200)),
+            "fields": "files(id,name)",
+        },
+    )
+    return [{"spreadsheet_id": str(item.get("id") or ""), "title": str(item.get("name") or "")} for item in payload.get("files", [])]
+
+
+def list_sheet_tabs(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    spreadsheet_id: str,
+) -> list[dict]:
+    access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
+    payload = _google_request(
+        method="GET",
+        access_token=access_token,
+        url=f"{GOOGLE_SHEETS_BASE_URL}/{quote(spreadsheet_id, safe='')}",
+        params={"fields": "sheets(properties(sheetId,title))"},
+    )
+    tabs: list[dict] = []
+    for item in payload.get("sheets", []):
+        props = item.get("properties") or {}
+        tabs.append({"title": str(props.get("title") or ""), "sheet_id": props.get("sheetId")})
+    return tabs
+
+
+def list_contact_groups(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    limit: int = 200,
+) -> list[dict]:
+    access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
+    payload = _google_request(
+        method="GET",
+        access_token=access_token,
+        url=f"{GOOGLE_PEOPLE_BASE_URL}/contactGroups",
+        params={"pageSize": max(1, min(limit, 1000))},
+    )
+    rows: list[dict] = []
+    for item in payload.get("contactGroups", []):
+        rows.append(
+            {
+                "resource_name": str(item.get("resourceName") or ""),
+                "name": str(item.get("name") or item.get("formattedName") or ""),
+            }
+        )
+    return rows
 
 
 def _calendar_event_payload(payload: dict) -> dict:
@@ -899,27 +1439,40 @@ def sync_connector(
     *,
     client_id: str,
     client_secret: str,
-) -> tuple[int, int, int]:
+) -> dict[str, int]:
     run = start_sync_run(db, connector.tenant_id, "google", connector.id)
 
     try:
+        if not connector.sync_scope_configured:
+            raise ValueError("Sync scope is not configured. Save sync options before running sync.")
         access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
 
-        gmail_count = 0
-        calendar_count = 0
+        counts = {
+            "gmail": 0,
+            "calendar": 0,
+            "drive": 0,
+            "sheets": 0,
+            "contacts": 0,
+        }
         if connector.gmail_enabled:
-            gmail_count = sync_gmail(db, connector, access_token=access_token)
+            counts["gmail"] = sync_gmail(db, connector, access_token=access_token)
         if connector.calendar_enabled:
-            calendar_count = sync_calendar(db, connector, access_token=access_token)
+            counts["calendar"] = sync_calendar(db, connector, access_token=access_token)
+        if connector.drive_enabled:
+            counts["drive"] = sync_drive(db, connector, access_token=access_token)
+        if connector.sheets_enabled:
+            counts["sheets"] = sync_sheets(db, connector, access_token=access_token)
+        if connector.contacts_enabled:
+            counts["contacts"] = sync_contacts(db, connector, access_token=access_token)
 
-        total = gmail_count + calendar_count
+        total = sum(counts.values())
         connector.last_items_synced = total
         connector.last_error = None
         connector.last_sync_at = _utcnow()
         db.commit()
 
         finish_sync_run(db, run, status="success", items_synced=total)
-        return total, gmail_count, calendar_count
+        return {"total": total, **counts}
     except Exception as exc:
         connector.last_error = str(exc)
         db.commit()
@@ -927,12 +1480,36 @@ def sync_connector(
         raise
 
 
+def append_crm_row(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    values: list[str],
+) -> None:
+    if not connector.crm_sheet_spreadsheet_id:
+        raise ValueError("CRM sheet spreadsheet id is not configured")
+    tab = connector.crm_sheet_tab_name or "Leads"
+    access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
+    _google_request(
+        method="POST",
+        access_token=access_token,
+        url=(
+            f"{GOOGLE_SHEETS_BASE_URL}/{quote(connector.crm_sheet_spreadsheet_id, safe='')}/values/"
+            f"{quote(tab + '!A:Z', safe='!:$')}:append"
+        ),
+        params={"valueInputOption": "RAW"},
+        json_body={"values": [values]},
+    )
+
+
 def disconnect_account(db: Session, connector: GoogleUserConnector) -> int:
     docs = db.execute(
         select(Document).where(
             Document.tenant_id == connector.tenant_id,
             Document.deleted_at.is_(None),
-            Document.source_type.in_(["google_gmail", "google_calendar"]),
+            Document.source_type.in_(["google_gmail", "google_calendar", "google_drive", "google_sheets", "google_contacts"]),
             Document.source_id.like(f"{connector.id}:%"),
         )
     ).scalars().all()

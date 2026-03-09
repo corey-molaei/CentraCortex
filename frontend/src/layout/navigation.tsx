@@ -140,7 +140,7 @@ export const navigationSections: NavSection[] = [
     title: "Connectors",
     items: [
       { label: "Connectors Hub", path: "/connectors", icon: PlugIcon },
-      { label: "Google Workspace", path: "/connectors/google-workspace", icon: PlugIcon },
+      { label: "Google", path: "/connectors/google", icon: PlugIcon },
       { label: "Channels", path: "/channels", icon: PlugIcon }
     ]
   },

@@ -51,7 +51,6 @@ from app.models.user import User
 from app.models.user_identity import UserIdentity
 from app.models.user_role_assignment import UserRoleAssignment
 from app.models.workspace_contact import WorkspaceContact
-from app.models.workspace_google_integration import WorkspaceGoogleIntegration
 from app.models.workspace_recipe_state import WorkspaceRecipeState
 from app.models.workspace_settings import WorkspaceSettings
 
@@ -109,7 +108,6 @@ __all__ = [
     "User",
     "UserIdentity",
     "WorkspaceContact",
-    "WorkspaceGoogleIntegration",
     "WorkspaceRecipeState",
     "WorkspaceSettings",
 ]

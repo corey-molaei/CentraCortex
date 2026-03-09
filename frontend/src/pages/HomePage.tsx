@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { getCurrentTenant, getSession } from "../api/client";
+import { listGoogleAccounts, type GoogleAccountRead } from "../api/connectors";
 import { listConversations } from "../api/llm";
-import { getWorkspaceGoogleConfig, listChannelConnectors } from "../api/workspace";
+import { listChannelConnectors } from "../api/workspace";
 import { Alert } from "../components/ui/Alert";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/Card";
 import { PageContainer } from "../layout/PageContainer";
 import type { Tenant, UserSession } from "../types/auth";
 import type { ConversationSummary } from "../types/llm";
-import type { ChannelConnector, WorkspaceGoogleIntegration } from "../types/workspace";
+import type { ChannelConnector } from "../types/workspace";
 
 const shortcuts = [
   { label: "Users", to: "/admin/users" },
@@ -27,7 +28,7 @@ const shortcuts = [
 export function HomePage() {
   const [session, setSession] = useState<UserSession | null>(null);
   const [tenant, setTenant] = useState<Tenant | null>(null);
-  const [workspaceGoogle, setWorkspaceGoogle] = useState<WorkspaceGoogleIntegration | null>(null);
+  const [workspaceGoogle, setWorkspaceGoogle] = useState<GoogleAccountRead | null>(null);
   const [channels, setChannels] = useState<ChannelConnector[]>([]);
   const [recentConversations, setRecentConversations] = useState<ConversationSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -37,13 +38,13 @@ export function HomePage() {
       const [sessionData, currentTenant, googleCfg, channelRows, conversations] = await Promise.all([
         getSession(),
         getCurrentTenant(),
-        getWorkspaceGoogleConfig().catch(() => null),
+        listGoogleAccounts().catch(() => []),
         listChannelConnectors().catch(() => []),
         listConversations().catch(() => [])
       ]);
       setSession(sessionData);
       setTenant(currentTenant);
-      setWorkspaceGoogle(googleCfg);
+      setWorkspaceGoogle(googleCfg.find((item) => item.is_workspace_default) ?? googleCfg[0] ?? null);
       setChannels(channelRows);
       setRecentConversations(conversations.slice(0, 5));
     } catch (err) {
@@ -98,16 +99,16 @@ export function HomePage() {
 
           <Card className="lg:col-span-1">
             <CardHeader>
-              <CardTitle>Google Workspace</CardTitle>
-              <CardDescription>Shared automation account for channel workflows.</CardDescription>
+              <CardTitle>Google</CardTitle>
+              <CardDescription>Workspace-default Google account used for shared automation.</CardDescription>
             </CardHeader>
             <CardContent className="text-sm text-slate-200">
               <p>Connected: {workspaceGoogle?.is_oauth_connected ? "Yes" : "No"}</p>
               <p>Account: {workspaceGoogle?.google_account_email ?? "-"}</p>
               <p>Last sync: {workspaceGoogle?.status.last_sync_at ?? "-"}</p>
               <p>Last error: {workspaceGoogle?.status.last_error ?? "-"}</p>
-              <Link className="mt-3 inline-block text-accent underline" to="/connectors/google-workspace">
-                Open integration
+              <Link className="mt-3 inline-block text-accent underline" to="/connectors/google">
+                Open connector
               </Link>
             </CardContent>
           </Card>
