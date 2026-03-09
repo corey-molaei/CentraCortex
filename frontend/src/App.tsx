@@ -16,7 +16,6 @@ import { DBConnectorPage } from "./pages/connectors/DBConnectorPage";
 import { EmailConnectorPage } from "./pages/connectors/EmailConnectorPage";
 import { FileUploadConnectorPage } from "./pages/connectors/FileUploadConnectorPage";
 import { GoogleConnectorPage } from "./pages/connectors/GoogleConnectorPage";
-import { GoogleWorkspaceConnectorPage } from "./pages/connectors/GoogleWorkspaceConnectorPage";
 import { JiraConnectorPage } from "./pages/connectors/JiraConnectorPage";
 import { LogsConnectorPage } from "./pages/connectors/LogsConnectorPage";
 import { SharePointConnectorPage } from "./pages/connectors/SharePointConnectorPage";
@@ -79,7 +78,6 @@ export function App() {
         <Route element={<JiraConnectorPage />} path="/connectors/jira" />
         <Route element={<SlackConnectorPage />} path="/connectors/slack" />
         <Route element={<GoogleConnectorPage />} path="/connectors/google" />
-        <Route element={<GoogleWorkspaceConnectorPage />} path="/connectors/google-workspace" />
         <Route element={<EmailConnectorPage />} path="/connectors/email" />
         <Route element={<CodeRepoConnectorPage />} path="/connectors/code-repo" />
         <Route element={<ConfluenceConnectorPage />} path="/connectors/confluence" />

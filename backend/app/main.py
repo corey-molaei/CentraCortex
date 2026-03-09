@@ -38,7 +38,6 @@ from app.routers.connectors import (
     email,
     file_upload,
     google,
-    google_workspace,
     jira,
     logs,
     sharepoint,
@@ -100,7 +99,6 @@ app.include_router(channels.router, prefix="/api/v1")
 app.include_router(jira.router, prefix="/api/v1")
 app.include_router(slack.router, prefix="/api/v1")
 app.include_router(google.router, prefix="/api/v1")
-app.include_router(google_workspace.router, prefix="/api/v1")
 app.include_router(email.router, prefix="/api/v1")
 app.include_router(code_repo.router, prefix="/api/v1")
 app.include_router(confluence.router, prefix="/api/v1")

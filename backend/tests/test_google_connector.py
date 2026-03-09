@@ -72,6 +72,7 @@ def _create_account(client, token: str, tenant_id: str, *, label: str = "Work") 
             "gmail_labels": ["INBOX", "SENT"],
             "calendar_enabled": True,
             "calendar_ids": ["primary"],
+            "sync_scope_configured": True,
         },
     )
     assert response.status_code == 200
@@ -272,6 +273,120 @@ def test_google_sync_writes_private_docs_with_account_prefixed_ids(client, db_se
     assert policy.allowed_user_ids == [user.id]
 
 
+def test_new_account_requires_sync_scope_before_sync(client, db_session):
+    tenant = _seed_tenant(db_session, slug="google-sync-scope-required")
+    user = _seed_user(db_session, tenant=tenant, email="scope-required@example.com", is_default=True)
+    token = _login(client, email=user.email)
+
+    created = client.post(
+        "/api/v1/connectors/google/accounts",
+        headers=_auth(token, tenant.id),
+        json={
+            "label": "Work",
+            "enabled": True,
+            "gmail_enabled": True,
+            "gmail_labels": ["INBOX"],
+            "calendar_enabled": True,
+            "calendar_ids": ["primary"],
+            "sync_scope_configured": False,
+        },
+    )
+    assert created.status_code == 200
+    account_id = created.json()["id"]
+
+    account = db_session.get(GoogleUserConnector, account_id)
+    assert account is not None
+    account.access_token_encrypted = encrypt_secret("token")
+    account.refresh_token_encrypted = encrypt_secret("refresh")
+    account.token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    db_session.commit()
+
+    response = client.post(
+        f"/api/v1/connectors/google/accounts/{account_id}/sync",
+        headers=_auth(token, tenant.id),
+    )
+    assert response.status_code == 400
+    assert "Sync scope is not configured" in response.json()["detail"]
+
+
+def test_gmail_sync_last_n_days_applies_query(client, db_session, monkeypatch):
+    tenant = _seed_tenant(db_session, slug="google-sync-last-n-days")
+    user = _seed_user(db_session, tenant=tenant, email="last-days@example.com", is_default=True)
+    token = _login(client, email=user.email)
+
+    account_id = _create_account(client, token, tenant.id)
+    account = db_session.get(GoogleUserConnector, account_id)
+    assert account is not None
+    account.access_token_encrypted = encrypt_secret("token")
+    account.refresh_token_encrypted = encrypt_secret("refresh")
+    account.token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    account.gmail_sync_mode = "last_n_days"
+    account.gmail_last_n_days = 7
+    db_session.commit()
+
+    seen_queries: list[str] = []
+
+    def fake_google_request(**kwargs):
+        url = kwargs["url"]
+        params = kwargs.get("params") or {}
+        if kwargs["method"] == "GET" and url.endswith("/messages"):
+            seen_queries.append(str(params.get("q") or ""))
+            return {"messages": []}
+        if kwargs["method"] == "GET" and "/calendar/v3/calendars/primary/events" in url:
+            return {"items": []}
+        return {}
+
+    monkeypatch.setattr("app.services.connectors.google_service._google_request", fake_google_request)
+
+    response = client.post(
+        f"/api/v1/connectors/google/accounts/{account_id}/sync",
+        headers=_auth(token, tenant.id),
+    )
+    assert response.status_code == 200
+    assert any("newer_than:7d" in value for value in seen_queries)
+
+
+def test_calendar_sync_range_days_applies_time_window(client, db_session, monkeypatch):
+    tenant = _seed_tenant(db_session, slug="google-sync-calendar-range")
+    user = _seed_user(db_session, tenant=tenant, email="calendar-range@example.com", is_default=True)
+    token = _login(client, email=user.email)
+
+    account_id = _create_account(client, token, tenant.id)
+    account = db_session.get(GoogleUserConnector, account_id)
+    assert account is not None
+    account.access_token_encrypted = encrypt_secret("token")
+    account.refresh_token_encrypted = encrypt_secret("refresh")
+    account.token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    account.calendar_sync_mode = "range_days"
+    account.calendar_days_back = 3
+    account.calendar_days_forward = 10
+    db_session.commit()
+
+    seen_time_min: list[str] = []
+    seen_time_max: list[str] = []
+
+    def fake_google_request(**kwargs):
+        url = kwargs["url"]
+        params = kwargs.get("params") or {}
+        if kwargs["method"] == "GET" and url.endswith("/messages"):
+            return {"messages": []}
+        if kwargs["method"] == "GET" and "/calendar/v3/calendars/primary/events" in url:
+            seen_time_min.append(str(params.get("timeMin") or ""))
+            seen_time_max.append(str(params.get("timeMax") or ""))
+            return {"items": []}
+        return {}
+
+    monkeypatch.setattr("app.services.connectors.google_service._google_request", fake_google_request)
+
+    response = client.post(
+        f"/api/v1/connectors/google/accounts/{account_id}/sync",
+        headers=_auth(token, tenant.id),
+    )
+    assert response.status_code == 200
+    assert any(value for value in seen_time_min)
+    assert any(value for value in seen_time_max)
+
+
 def test_disconnect_soft_deletes_google_documents(client, db_session):
     tenant = _seed_tenant(db_session, slug="google-disconnect")
     user = _seed_user(db_session, tenant=tenant, email="disconnect@example.com", is_default=True)
@@ -451,6 +566,7 @@ def test_worker_sync_processes_enabled_google_user_accounts(db_session, monkeypa
                 gmail_labels=["INBOX"],
                 calendar_ids=["primary"],
                 enabled=True,
+                sync_scope_configured=True,
             ),
             GoogleUserConnector(
                 tenant_id=tenant_b.id,
@@ -464,6 +580,7 @@ def test_worker_sync_processes_enabled_google_user_accounts(db_session, monkeypa
                 gmail_labels=["INBOX"],
                 calendar_ids=["primary"],
                 enabled=True,
+                sync_scope_configured=True,
             ),
         ]
     )

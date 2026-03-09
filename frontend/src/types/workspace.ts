@@ -35,41 +35,6 @@ export type ConnectorStatus = {
   last_error: string | null;
 };
 
-export type WorkspaceGoogleIntegration = {
-  id: string;
-  tenant_id: string;
-  google_account_email: string | null;
-  google_account_sub: string | null;
-  is_oauth_connected: boolean;
-  scopes: string[];
-  enabled: boolean;
-  gmail_enabled: boolean;
-  gmail_labels: string[];
-  calendar_enabled: boolean;
-  calendar_ids: string[];
-  drive_enabled: boolean;
-  drive_folder_ids: string[];
-  sheets_enabled: boolean;
-  sheets_targets: Array<Record<string, unknown>>;
-  crm_sheet_spreadsheet_id: string | null;
-  crm_sheet_tab_name: string | null;
-  status: ConnectorStatus;
-};
-
-export type WorkspaceGoogleIntegrationUpdate = {
-  enabled?: boolean;
-  gmail_enabled?: boolean;
-  gmail_labels?: string[];
-  calendar_enabled?: boolean;
-  calendar_ids?: string[];
-  drive_enabled?: boolean;
-  drive_folder_ids?: string[];
-  sheets_enabled?: boolean;
-  sheets_targets?: Array<Record<string, unknown>>;
-  crm_sheet_spreadsheet_id?: string | null;
-  crm_sheet_tab_name?: string | null;
-};
-
 export type KnowledgeHealthItem = {
   source_type: string;
   documents: number;

@@ -78,7 +78,8 @@ class Settings(BaseSettings):
         "https://www.googleapis.com/auth/calendar,"
         "https://www.googleapis.com/auth/calendar.events,"
         "https://www.googleapis.com/auth/drive.readonly,"
-        "https://www.googleapis.com/auth/spreadsheets"
+        "https://www.googleapis.com/auth/spreadsheets,"
+        "https://www.googleapis.com/auth/contacts.readonly"
     )
     codex_client_id: str | None = None
     codex_oauth_scopes: str = "openid profile email offline_access"

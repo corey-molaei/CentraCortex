@@ -2,8 +2,6 @@ import type {
   ChannelConnector,
   KnowledgeHealthResponse,
   Recipe,
-  WorkspaceGoogleIntegration,
-  WorkspaceGoogleIntegrationUpdate,
   WorkspaceRecipeState,
   WorkspaceSettings,
   WorkspaceSettingsUpdate
@@ -72,48 +70,6 @@ export function updateRecipeState(recipeId: string, payload: { enabled: boolean;
     method: "PUT",
     body: JSON.stringify(payload)
   });
-}
-
-export function getWorkspaceGoogleConfig() {
-  return request<WorkspaceGoogleIntegration>("/api/v1/connectors/google-workspace/config");
-}
-
-export function updateWorkspaceGoogleConfig(payload: WorkspaceGoogleIntegrationUpdate) {
-  return request<WorkspaceGoogleIntegration>("/api/v1/connectors/google-workspace/config", {
-    method: "PUT",
-    body: JSON.stringify(payload)
-  });
-}
-
-export function startWorkspaceGoogleOAuth(redirectUri: string) {
-  return request<{ auth_url: string; state: string }>(
-    `/api/v1/connectors/google-workspace/oauth/start?redirect_uri=${encodeURIComponent(redirectUri)}`
-  );
-}
-
-export function completeWorkspaceGoogleOAuth(code: string, state: string) {
-  return request<{ message: string }>(
-    `/api/v1/connectors/google-workspace/oauth/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`
-  );
-}
-
-export function testWorkspaceGoogle() {
-  return request<{ success: boolean; message: string }>("/api/v1/connectors/google-workspace/test", { method: "POST" });
-}
-
-export function syncWorkspaceGoogle() {
-  return request<{ status: string; items_synced: number; message: string }>("/api/v1/connectors/google-workspace/sync", {
-    method: "POST"
-  });
-}
-
-export function workspaceGoogleStatus() {
-  return request<{
-    enabled: boolean;
-    last_sync_at: string | null;
-    last_items_synced: number;
-    last_error: string | null;
-  }>("/api/v1/connectors/google-workspace/status");
 }
 
 export function listChannelConnectors() {

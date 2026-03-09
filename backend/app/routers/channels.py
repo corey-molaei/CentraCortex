@@ -9,6 +9,7 @@ from app.core.security import decrypt_secret, encrypt_secret
 from app.models.channel_facebook_connector import ChannelFacebookConnector
 from app.models.channel_telegram_connector import ChannelTelegramConnector
 from app.models.channel_whatsapp_connector import ChannelWhatsAppConnector
+from app.models.connectors.google_user_connector import GoogleUserConnector
 from app.models.tenant_membership import TenantMembership
 from app.schemas.channels import (
     ChannelConnectorRead,
@@ -19,7 +20,6 @@ from app.schemas.channels import (
     WhatsAppConnectorUpdate,
 )
 from app.services.channel_dispatcher import resolve_contact, run_channel_message
-from app.services.connectors.google_workspace_service import get_or_create_integration
 
 router = APIRouter(prefix="/channels", tags=["channels"])
 
@@ -192,9 +192,19 @@ def telegram_webhook(
     if not row.enabled:
         raise HTTPException(status_code=400, detail="Telegram connector is disabled")
 
-    integration = get_or_create_integration(db, tenant_id=tenant_id)
-    if not integration.access_token_encrypted:
-        raise HTTPException(status_code=400, detail="Workspace Google integration is not connected")
+    integration = db.execute(
+        select(GoogleUserConnector).where(
+            GoogleUserConnector.tenant_id == tenant_id,
+            GoogleUserConnector.is_workspace_default.is_(True),
+            GoogleUserConnector.enabled.is_(True),
+            GoogleUserConnector.access_token_encrypted.is_not(None),
+        )
+    ).scalar_one_or_none()
+    if not integration:
+        raise HTTPException(
+            status_code=400,
+            detail="Workspace default Google account is not connected. Configure /connectors/google first.",
+        )
 
     contact = resolve_contact(
         db,
