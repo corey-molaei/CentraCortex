@@ -22,8 +22,8 @@ def put_raw_document_blob(tenant_id: str, source_type: str, source_id: str, payl
     return put_blob_object(object_name, payload)
 
 
-def ensure_bucket() -> None:
-    ensure_raw_storage_ready()
+def ensure_bucket() -> str:
+    return ensure_raw_storage_ready()
 
 
 def resolve_default_document_acl(db: Session, tenant_id: str) -> str | None:

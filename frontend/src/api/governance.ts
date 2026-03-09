@@ -1,7 +1,6 @@
 import type { ApprovalQueueItem, AuditLogItem } from "../types/governance";
 import { sessionStore } from "./session";
-
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
+import { API_BASE_URL } from "./base";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = sessionStore.getAccessToken();

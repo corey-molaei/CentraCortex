@@ -54,12 +54,13 @@ class Settings(BaseSettings):
     celery_result_backend: str = "redis://redis:6379/2"
 
     qdrant_url: str = "http://qdrant:6333"
+    qdrant_api_key: str | None = None
 
-    minio_endpoint: str = "minio:9000"
-    minio_access_key: str = "minioadmin"
-    minio_secret_key: str = "minioadmin"
-    minio_secure: bool = False
-    minio_bucket_raw_documents: str = "raw-documents"
+    storage_backend: str = "local"
+    gcs_project_id: str | None = None
+    gcs_bucket_raw_documents: str = "centracortex-raw-documents"
+    gcs_bucket_location: str = "australia-southeast1"
+    gcs_auto_create_bucket: bool = False
     raw_documents_local_path: str = "/tmp/centracortex-raw-documents"
 
     slack_client_id: str | None = None
@@ -82,9 +83,15 @@ class Settings(BaseSettings):
     codex_client_id: str | None = None
     codex_oauth_scopes: str = "openid profile email offline_access"
 
-    embedding_dimension: int = 384
-    chunk_size_chars: int = 1200
-    chunk_overlap_chars: int = 150
+    embedding_dimension: int = 1024
+    chunk_size_chars: int = 700
+    chunk_overlap_chars: int = 100
+    retrieval_embedding_model_enabled: bool = True
+    retrieval_embedding_model_name: str = "BAAI/bge-m3"
+    retrieval_reranker_enabled: bool = True
+    retrieval_reranker_model_name: str = "BAAI/bge-reranker-v2-m3"
+    retrieval_model_device: str = "cpu"
+    retrieval_rerank_candidate_k: int = 30
     qdrant_timeout_seconds: float = 5.0
     retrieval_min_hybrid_score_abs: float = 0.06
     retrieval_min_relative_ratio: float = 0.60

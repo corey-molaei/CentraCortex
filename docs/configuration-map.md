@@ -59,12 +59,12 @@ Source of truth:
 | `CELERY_RESULT_BACKEND` | `redis://redis:6379/2` | Celery | Result backend DSN |
 | `QDRANT_URL` | `http://qdrant:6333` | Vector retrieval | Qdrant endpoint |
 | `QDRANT_TIMEOUT_SECONDS` | `5.0` | Vector retrieval | Qdrant client timeout |
-| `MINIO_ENDPOINT` | `minio:9000` | Blob storage | MinIO endpoint |
-| `MINIO_ACCESS_KEY` | `minioadmin` | Blob storage | Access key |
-| `MINIO_SECRET_KEY` | `minioadmin` | Blob storage | Secret key |
-| `MINIO_SECURE` | `false` | Blob storage | TLS for MinIO |
-| `MINIO_BUCKET_RAW_DOCUMENTS` | `raw-documents` | Document ingestion | Bucket for raw files |
-| `RAW_DOCUMENTS_LOCAL_PATH` | `/tmp/centracortex-raw-documents` | Local storage fallback | Raw document local path |
+| `STORAGE_BACKEND` | `local` | Raw document storage | `local` or `gcs` |
+| `GCS_PROJECT_ID` | empty | GCS client | Optional explicit project id |
+| `GCS_BUCKET_RAW_DOCUMENTS` | `centracortex-raw-documents` | Document ingestion | GCS bucket for raw files |
+| `GCS_BUCKET_LOCATION` | `australia-southeast1` | GCS bucket create path | Used when auto-creating bucket |
+| `GCS_AUTO_CREATE_BUCKET` | `false` | GCS startup behavior | Auto-create bucket when missing |
+| `RAW_DOCUMENTS_LOCAL_PATH` | `/tmp/centracortex-raw-documents` | Local storage backend | Raw document local path |
 
 ### 1.3 Retrieval / Chunking / RAG
 

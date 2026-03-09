@@ -1,11 +1,11 @@
 from fastapi import APIRouter
-from minio import Minio
 from qdrant_client import QdrantClient
 from redis import Redis
 from sqlalchemy import text
 
 from app.core.config import settings
 from app.db.session import engine
+from app.services.storage import ensure_raw_storage_ready
 
 router = APIRouter(prefix="/health", tags=["health"])
 
@@ -17,7 +17,7 @@ def live() -> dict[str, str]:
 
 @router.get("/ready")
 def ready() -> dict:
-    status = {"database": False, "redis": False, "qdrant": False, "minio": False}
+    status = {"database": False, "redis": False, "qdrant": False, "storage": False}
 
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
@@ -30,17 +30,15 @@ def ready() -> dict:
     redis_client.ping()
     status["redis"] = True
 
-    qdrant = QdrantClient(url=settings.qdrant_url)
+    qdrant = QdrantClient(
+        url=settings.qdrant_url,
+        api_key=settings.qdrant_api_key,
+        timeout=settings.qdrant_timeout_seconds,
+    )
     qdrant.get_collections()
     status["qdrant"] = True
 
-    minio_client = Minio(
-        settings.minio_endpoint,
-        access_key=settings.minio_access_key,
-        secret_key=settings.minio_secret_key,
-        secure=settings.minio_secure,
-    )
-    minio_client.bucket_exists(settings.minio_bucket_raw_documents)
-    status["minio"] = True
+    ensure_raw_storage_ready()
+    status["storage"] = True
 
     return {"status": "ok", "checks": status}

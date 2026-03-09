@@ -2,9 +2,9 @@
 
 ## What is implemented
 
-- Docker Compose stack with `api`, `worker`, `beat`, `postgres`, `redis`, `qdrant`, `minio`, `ui`
+- Docker Compose stack with `api`, `worker`, `beat`, `postgres`, `redis`, `qdrant`, `ui`
 - Health checks for all services
-- MinIO bootstrap bucket creation
+- Raw document storage abstraction (`local` or Google Cloud Storage)
 - FastAPI OpenAPI docs (`/docs`, `/openapi.json`)
 - Structured JSON logging with request IDs
 - Basic CI workflow (`.github/workflows/ci.yml`) and local CI script (`scripts/ci.sh`)

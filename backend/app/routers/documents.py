@@ -5,6 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_tenant_membership, get_db, require_tenant_admin
+from app.core.config import settings
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.models.tenant_membership import TenantMembership
@@ -18,6 +19,7 @@ from app.schemas.documents import (
     ForgetDocumentResponse,
     ReindexRequest,
     ReindexResponse,
+    ResetEmbeddingsResponse,
 )
 from app.services.acl import can_access_document
 from app.services.audit import audit_event
@@ -28,6 +30,7 @@ from app.services.document_indexing import (
     index_document,
     list_accessible_documents,
     reindex_documents,
+    reset_embedded_content,
 )
 
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -226,6 +229,35 @@ def reindex_many_documents(
         },
     )
     return ReindexResponse(indexed_documents=indexed_documents, indexed_chunks=indexed_chunks)
+
+
+@router.post("/reset-embeddings", response_model=ResetEmbeddingsResponse)
+def reset_embeddings_for_tenant(
+    request: Request,
+    admin: TenantMembership = Depends(require_tenant_admin),
+    db: Session = Depends(get_db),
+) -> ResetEmbeddingsResponse:
+    reset_documents, deleted_chunks = reset_embedded_content(db, tenant_id=admin.tenant_id)
+    audit_event(
+        db,
+        event_type="document.embedding.reset",
+        resource_type="document",
+        action="reset_embeddings",
+        tenant_id=admin.tenant_id,
+        user_id=admin.user_id,
+        request_id=getattr(request.state, "request_id", None),
+        ip_address=request.client.host if request.client else None,
+        payload={
+            "reset_documents": reset_documents,
+            "deleted_chunks": deleted_chunks,
+            "embedding_dimension": settings.embedding_dimension,
+        },
+    )
+    return ResetEmbeddingsResponse(
+        reset_documents=reset_documents,
+        deleted_chunks=deleted_chunks,
+        status="pending_reindex",
+    )
 
 
 @router.delete("/{document_id}", response_model=ForgetDocumentResponse)

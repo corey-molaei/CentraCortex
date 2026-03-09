@@ -1,3 +1,4 @@
+import pytest
 from sqlalchemy import select
 
 from app.core.security import get_password_hash
@@ -7,7 +8,7 @@ from app.models.tenant import Tenant
 from app.models.tenant_membership import TenantMembership
 from app.models.user import User
 from app.services.connectors.common import upsert_document
-from app.services.document_indexing import index_pending_documents
+from app.services.document_indexing import index_document, index_pending_documents
 
 
 def _seed_users(db_session):
@@ -178,6 +179,40 @@ def test_auto_index_retry_then_failed(db_session, monkeypatch):
     assert after_second.index_attempts == 2
     assert after_second.index_error == "forced index failure"
     assert after_second.next_index_attempt_at is None
+
+
+def test_index_document_does_not_mark_indexed_when_qdrant_upsert_fails(db_session, monkeypatch):
+    tenant, _, _ = _seed_users(db_session)
+    doc = upsert_document(
+        db_session,
+        tenant_id=tenant.id,
+        source_type="manual",
+        source_id="qdrant-failure-doc",
+        url=None,
+        title="Qdrant Failure",
+        author="system",
+        raw_text="content to index",
+        metadata_json={},
+    )
+
+    def _raise_upsert(*args, **kwargs):
+        raise RuntimeError("forced qdrant upsert failure")
+
+    monkeypatch.setattr("app.services.document_indexing._upsert_qdrant_chunks", _raise_upsert)
+
+    with pytest.raises(RuntimeError, match="forced qdrant upsert failure"):
+        index_document(db_session, tenant_id=tenant.id, document=doc)
+    db_session.rollback()
+
+    updated = db_session.execute(
+        select(Document).where(Document.id == doc.id, Document.tenant_id == tenant.id)
+    ).scalar_one()
+    assert updated.index_status == "pending"
+    assert updated.current_chunk_version == 0
+    chunks = db_session.execute(
+        select(DocumentChunk).where(DocumentChunk.document_id == doc.id, DocumentChunk.tenant_id == tenant.id)
+    ).scalars().all()
+    assert chunks == []
 
 
 def test_connector_document_update_resets_index_state(db_session):
@@ -374,3 +409,60 @@ def test_acl_filtered_search_and_forget_flow(client, db_session):
         .all()
     )
     assert deleted_chunks == []
+
+
+def test_reset_embeddings_keeps_documents_and_marks_pending(client, db_session):
+    tenant, _, _ = _seed_users(db_session)
+    admin_token = _login(client, "docs-owner@example.com")
+
+    created = client.post(
+        "/api/v1/retrieval/documents",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "source_type": "manual",
+            "source_id": "reset-embed-doc",
+            "title": "Reset Embedding Target",
+            "raw_text": "alpha beta gamma delta epsilon zeta eta theta",
+        },
+    )
+    assert created.status_code == 200
+    document_id = created.json()["id"]
+
+    reindex_one = client.post(
+        f"/api/v1/documents/{document_id}/reindex",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert reindex_one.status_code == 200
+    assert reindex_one.json()["indexed_chunks"] >= 1
+
+    before_chunks = (
+        db_session.execute(select(DocumentChunk).where(DocumentChunk.document_id == document_id, DocumentChunk.tenant_id == tenant.id))
+        .scalars()
+        .all()
+    )
+    assert len(before_chunks) >= 1
+
+    reset = client.post(
+        "/api/v1/documents/reset-embeddings",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert reset.status_code == 200
+    payload = reset.json()
+    assert payload["reset_documents"] >= 1
+    assert payload["deleted_chunks"] >= 1
+    assert payload["status"] == "pending_reindex"
+
+    doc_after = db_session.execute(
+        select(Document).where(Document.id == document_id, Document.tenant_id == tenant.id)
+    ).scalar_one()
+    assert doc_after is not None
+    assert doc_after.current_chunk_version == 0
+    assert doc_after.index_status == "pending"
+    assert doc_after.indexed_at is None
+
+    after_chunks = (
+        db_session.execute(select(DocumentChunk).where(DocumentChunk.document_id == document_id, DocumentChunk.tenant_id == tenant.id))
+        .scalars()
+        .all()
+    )
+    assert after_chunks == []

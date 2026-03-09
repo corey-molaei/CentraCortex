@@ -69,6 +69,12 @@ class ReindexResponse(BaseModel):
     indexed_chunks: int
 
 
+class ResetEmbeddingsResponse(BaseModel):
+    reset_documents: int
+    deleted_chunks: int
+    status: str
+
+
 class ForgetDocumentResponse(BaseModel):
     status: str
     document_id: str

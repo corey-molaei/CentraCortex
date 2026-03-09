@@ -5,7 +5,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import cast
+from typing import Any, cast
 
 import structlog
 from qdrant_client import QdrantClient
@@ -17,6 +17,7 @@ from app.core.config import settings
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
 from app.services.acl import get_accessible_documents
+from app.services.retrieval_models import embed_query, embed_texts, rerank
 from app.services.storage import delete_raw_document_blob
 
 logger = structlog.get_logger(__name__)
@@ -42,14 +43,14 @@ def tenant_collection_name(tenant_id: str) -> str:
 
 
 def _qdrant_client() -> QdrantClient:
-    return QdrantClient(url=settings.qdrant_url, timeout=settings.qdrant_timeout_seconds)
+    return QdrantClient(
+        url=settings.qdrant_url,
+        api_key=settings.qdrant_api_key,
+        timeout=settings.qdrant_timeout_seconds,
+    )
 
 
-def _ensure_tenant_collection(tenant_id: str) -> None:
-    collection_name = tenant_collection_name(tenant_id)
-    client = _qdrant_client()
-    if client.collection_exists(collection_name):
-        return
+def _create_tenant_collection(client: QdrantClient, collection_name: str) -> None:
     client.create_collection(
         collection_name=collection_name,
         vectors_config=qmodels.VectorParams(
@@ -57,6 +58,58 @@ def _ensure_tenant_collection(tenant_id: str) -> None:
             distance=qmodels.Distance.COSINE,
         ),
     )
+
+
+def _extract_collection_vector_size(vectors_cfg: Any) -> int | None:
+    if vectors_cfg is None:
+        return None
+
+    direct_size = getattr(vectors_cfg, "size", None)
+    if direct_size is not None:
+        return int(direct_size)
+
+    if isinstance(vectors_cfg, dict):
+        if "size" in vectors_cfg:
+            return int(vectors_cfg["size"])
+        if vectors_cfg:
+            first = next(iter(vectors_cfg.values()))
+            if isinstance(first, dict) and "size" in first:
+                return int(first["size"])
+            first_size = getattr(first, "size", None)
+            if first_size is not None:
+                return int(first_size)
+
+    return None
+
+
+def _ensure_tenant_collection(tenant_id: str) -> None:
+    collection_name = tenant_collection_name(tenant_id)
+    client = _qdrant_client()
+    if not client.collection_exists(collection_name):
+        _create_tenant_collection(client, collection_name)
+        return
+
+    info = client.get_collection(collection_name)
+    vectors_cfg = getattr(getattr(info, "config", None), "params", None)
+    vectors_cfg = getattr(vectors_cfg, "vectors", None)
+    existing_size = _extract_collection_vector_size(vectors_cfg)
+    if existing_size is not None and existing_size != settings.embedding_dimension:
+        raise ValueError(
+            f"Qdrant vector size mismatch for {collection_name}: "
+            f"expected {settings.embedding_dimension}, got {existing_size}. "
+            "Run embedding reset/reindex for this tenant."
+        )
+
+
+def _reset_tenant_collection(tenant_id: str) -> None:
+    collection_name = tenant_collection_name(tenant_id)
+    try:
+        client = _qdrant_client()
+        if client.collection_exists(collection_name):
+            client.delete_collection(collection_name)
+        _create_tenant_collection(client, collection_name)
+    except Exception as exc:  # pragma: no cover - network-dependent path
+        logger.warning("qdrant_collection_reset_failed", tenant_id=tenant_id, error=str(exc))
 
 
 def _split_text(text: str) -> list[str]:
@@ -86,8 +139,7 @@ def _split_text(text: str) -> list[str]:
     return chunks
 
 
-def embed_text(text: str) -> list[float]:
-    dim = settings.embedding_dimension
+def _hash_embed_text(text: str, *, dim: int) -> list[float]:
     vector = [0.0] * dim
     tokens = re.findall(r"[a-z0-9_]+", text.lower())
     if not tokens:
@@ -107,7 +159,19 @@ def embed_text(text: str) -> list[float]:
     return [v / norm for v in vector]
 
 
-def _delete_qdrant_document_points(tenant_id: str, document_id: str) -> None:
+def _embed_text_with_model_fallback(text: str) -> tuple[list[float], str]:
+    model_vector = embed_query(text, expected_dimension=settings.embedding_dimension)
+    if model_vector is not None:
+        return model_vector, settings.retrieval_embedding_model_name
+    return _hash_embed_text(text, dim=settings.embedding_dimension), "hash-v1-fallback"
+
+
+def embed_text(text: str) -> list[float]:
+    vector, _ = _embed_text_with_model_fallback(text)
+    return vector
+
+
+def _delete_qdrant_document_points(tenant_id: str, document_id: str, *, strict: bool = False) -> None:
     try:
         _ensure_tenant_collection(tenant_id)
         client = _qdrant_client()
@@ -127,9 +191,17 @@ def _delete_qdrant_document_points(tenant_id: str, document_id: str) -> None:
         )
     except Exception as exc:  # pragma: no cover - network-dependent path
         logger.warning("qdrant_delete_failed", tenant_id=tenant_id, document_id=document_id, error=str(exc))
+        if strict:
+            raise
 
 
-def _upsert_qdrant_chunks(tenant_id: str, document: Document, chunks: list[DocumentChunk]) -> None:
+def _upsert_qdrant_chunks(
+    tenant_id: str,
+    document: Document,
+    chunks: list[DocumentChunk],
+    *,
+    strict: bool = False,
+) -> None:
     try:
         _ensure_tenant_collection(tenant_id)
         client = _qdrant_client()
@@ -156,6 +228,8 @@ def _upsert_qdrant_chunks(tenant_id: str, document: Document, chunks: list[Docum
             client.upsert(collection_name=tenant_collection_name(tenant_id), points=points, wait=True)
     except Exception as exc:  # pragma: no cover - network-dependent path
         logger.warning("qdrant_upsert_failed", tenant_id=tenant_id, document_id=document.id, error=str(exc))
+        if strict:
+            raise
 
 
 def index_document(db: Session, *, tenant_id: str, document: Document) -> tuple[int, int]:
@@ -175,11 +249,16 @@ def index_document(db: Session, *, tenant_id: str, document: Document) -> tuple[
             DocumentChunk.chunk_version == next_version,
         )
     )
-    db.commit()
+
+    embedding_model_name = "hash-v1-fallback"
+    embeddings = embed_texts(chunks_text, expected_dimension=settings.embedding_dimension)
+    if embeddings is not None:
+        embedding_model_name = settings.retrieval_embedding_model_name
+    else:
+        embeddings = [_hash_embed_text(chunk_text, dim=settings.embedding_dimension) for chunk_text in chunks_text]
 
     chunks: list[DocumentChunk] = []
-    for idx, chunk_text in enumerate(chunks_text):
-        embedding = embed_text(chunk_text)
+    for idx, (chunk_text, embedding) in enumerate(zip(chunks_text, embeddings, strict=False)):
         chunk = DocumentChunk(
             tenant_id=tenant_id,
             document_id=document.id,
@@ -187,7 +266,7 @@ def index_document(db: Session, *, tenant_id: str, document: Document) -> tuple[
             chunk_version=next_version,
             content=chunk_text,
             token_count=len(chunk_text.split()),
-            embedding_model="hash-v1",
+            embedding_model=embedding_model_name,
             embedding_vector=embedding,
             acl_policy_id=document.acl_policy_id,
             metadata_json={
@@ -199,6 +278,8 @@ def index_document(db: Session, *, tenant_id: str, document: Document) -> tuple[
         )
         db.add(chunk)
         chunks.append(chunk)
+    db.flush()
+    _upsert_qdrant_chunks(tenant_id, document, chunks, strict=True)
 
     document.current_chunk_version = next_version
     document.indexed_at = utcnow()
@@ -207,11 +288,6 @@ def index_document(db: Session, *, tenant_id: str, document: Document) -> tuple[
     document.index_attempts = 0
     document.next_index_attempt_at = None
     db.commit()
-    for chunk in chunks:
-        db.refresh(chunk)
-
-    _delete_qdrant_document_points(tenant_id, document.id)
-    _upsert_qdrant_chunks(tenant_id, document, chunks)
     return next_version, len(chunks)
 
 
@@ -469,10 +545,11 @@ def _vector_chunks(
     if not accessible_doc_ids:
         return []
 
+    vector = embed_text(query)
+
     try:
         _ensure_tenant_collection(tenant_id)
         client = _qdrant_client()
-        vector = embed_text(query)
         hits = client.search(
             collection_name=tenant_collection_name(tenant_id),
             query_vector=vector,
@@ -513,6 +590,29 @@ def _vector_chunks(
     return results
 
 
+def _sigmoid(value: float) -> float:
+    clamped = max(-20.0, min(20.0, value))
+    return 1.0 / (1.0 + math.exp(-clamped))
+
+
+def _rerank_chunks(query: str, candidates: list[ChunkSearchResult]) -> list[ChunkSearchResult]:
+    if not candidates or not settings.retrieval_reranker_enabled:
+        return candidates
+
+    rerank_scores = rerank(query, [item.chunk.content for item in candidates])
+    if rerank_scores is None or len(rerank_scores) != len(candidates):
+        return candidates
+
+    reranked: list[ChunkSearchResult] = []
+    for item, raw_score in zip(candidates, rerank_scores, strict=False):
+        normalized = _sigmoid(raw_score)
+        blended = (item.score * 0.25) + (normalized * 0.75)
+        reranked.append(ChunkSearchResult(chunk=item.chunk, score=blended, ranker="hybrid-reranked"))
+
+    reranked.sort(key=lambda x: x.score, reverse=True)
+    return reranked
+
+
 def hybrid_search_chunks(
     db: Session,
     *,
@@ -526,8 +626,9 @@ def hybrid_search_chunks(
     if not accessible_doc_ids:
         return []
 
-    bm25 = _bm25_chunks(db, tenant_id=tenant_id, accessible_doc_ids=accessible_doc_ids, query=query, limit=limit * 3)
-    vector = _vector_chunks(db, tenant_id=tenant_id, accessible_doc_ids=accessible_doc_ids, query=query, limit=limit * 3)
+    candidate_limit = max(limit * 3, settings.retrieval_rerank_candidate_k)
+    bm25 = _bm25_chunks(db, tenant_id=tenant_id, accessible_doc_ids=accessible_doc_ids, query=query, limit=candidate_limit)
+    vector = _vector_chunks(db, tenant_id=tenant_id, accessible_doc_ids=accessible_doc_ids, query=query, limit=candidate_limit)
 
     combined: dict[str, ChunkSearchResult] = {}
     for item in bm25:
@@ -540,6 +641,11 @@ def hybrid_search_chunks(
             combined[item.chunk.id] = ChunkSearchResult(chunk=item.chunk, score=item.score * 0.55, ranker=item.ranker)
 
     ranked = sorted(combined.values(), key=lambda x: x.score, reverse=True)
+    if settings.retrieval_reranker_enabled and ranked:
+        rerank_pool = ranked[:candidate_limit]
+        reranked_pool = _rerank_chunks(query, rerank_pool)
+        ranked = reranked_pool + ranked[candidate_limit:]
+
     return ranked[:limit]
 
 
@@ -567,3 +673,50 @@ def reindex_documents(
         indexed_docs += 1
         indexed_chunks += chunks
     return indexed_docs, indexed_chunks
+
+
+def reset_embedded_content(db: Session, *, tenant_id: str) -> tuple[int, int]:
+    docs = (
+        db.execute(
+            select(Document).where(
+                Document.tenant_id == tenant_id,
+                Document.deleted_at.is_(None),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    doc_ids = [doc.id for doc in docs]
+
+    deleted_chunks = 0
+    if doc_ids:
+        deleted_chunks = int(
+            db.execute(
+                select(func.count(DocumentChunk.id)).where(
+                    DocumentChunk.tenant_id == tenant_id,
+                    DocumentChunk.document_id.in_(doc_ids),
+                )
+            ).scalar()
+            or 0
+        )
+
+        db.execute(
+            delete(DocumentChunk).where(
+                DocumentChunk.tenant_id == tenant_id,
+                DocumentChunk.document_id.in_(doc_ids),
+            )
+        )
+
+    now = utcnow()
+    for doc in docs:
+        doc.current_chunk_version = 0
+        doc.indexed_at = None
+        doc.index_status = INDEX_STATUS_PENDING
+        doc.index_error = None
+        doc.index_attempts = 0
+        doc.index_requested_at = now
+        doc.next_index_attempt_at = now
+
+    db.commit()
+    _reset_tenant_collection(tenant_id)
+    return len(docs), deleted_chunks

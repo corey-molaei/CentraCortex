@@ -1,4 +1,5 @@
 import { sessionStore } from "./session";
+import { API_BASE_URL } from "./base";
 import type {
   ChatV2Response,
   CodexOAuthStatus,
@@ -7,8 +8,6 @@ import type {
   LLMLog,
   LLMProvider,
 } from "../types/llm";
-
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = sessionStore.getAccessToken();

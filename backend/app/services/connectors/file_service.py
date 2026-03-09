@@ -39,8 +39,8 @@ def _extract_text(extension: str, content: bytes) -> str:
 
 def test_connection() -> tuple[bool, str]:
     try:
-        ensure_bucket()
-        return True, "File connector ready; MinIO bucket is accessible"
+        backend = ensure_bucket()
+        return True, f"File connector ready; {backend.upper()} raw storage is accessible"
     except Exception as exc:
         return False, f"File connector test failed: {exc}"
 
