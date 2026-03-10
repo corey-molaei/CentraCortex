@@ -1,19 +1,36 @@
 steps:
   - name: gcr.io/cloud-builders/docker
+    id: Pull cache
+    entrypoint: bash
+    args:
+      - -lc
+      - docker pull ${_AR_HOSTNAME}/${_AR_PROJECT_ID}/${_AR_REPOSITORY}/${REPO_NAME}/${_SERVICE_NAME}:buildcache || true
+
+  - name: gcr.io/cloud-builders/docker
     id: Build
     args:
       - build
+      - --cache-from
+      - ${_AR_HOSTNAME}/${_AR_PROJECT_ID}/${_AR_REPOSITORY}/${REPO_NAME}/${_SERVICE_NAME}:buildcache
       - -t
       - ${_AR_HOSTNAME}/${_AR_PROJECT_ID}/${_AR_REPOSITORY}/${REPO_NAME}/${_SERVICE_NAME}:${COMMIT_SHA}
+      - -t
+      - ${_AR_HOSTNAME}/${_AR_PROJECT_ID}/${_AR_REPOSITORY}/${REPO_NAME}/${_SERVICE_NAME}:buildcache
       - -f
       - ${_DOCKER_CONTEXT}/${_DOCKERFILE}
       - ${_DOCKER_CONTEXT}
 
   - name: gcr.io/cloud-builders/docker
-    id: Push
+    id: Push commit
     args:
       - push
       - ${_AR_HOSTNAME}/${_AR_PROJECT_ID}/${_AR_REPOSITORY}/${REPO_NAME}/${_SERVICE_NAME}:${COMMIT_SHA}
+
+  - name: gcr.io/cloud-builders/docker
+    id: Push cache
+    args:
+      - push
+      - ${_AR_HOSTNAME}/${_AR_PROJECT_ID}/${_AR_REPOSITORY}/${REPO_NAME}/${_SERVICE_NAME}:buildcache
 
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     id: Deploy
@@ -31,6 +48,7 @@ steps:
 
 images:
   - ${_AR_HOSTNAME}/${_AR_PROJECT_ID}/${_AR_REPOSITORY}/${REPO_NAME}/${_SERVICE_NAME}:${COMMIT_SHA}
+  - ${_AR_HOSTNAME}/${_AR_PROJECT_ID}/${_AR_REPOSITORY}/${REPO_NAME}/${_SERVICE_NAME}:buildcache
 
 options:
   substitutionOption: ALLOW_LOOSE
