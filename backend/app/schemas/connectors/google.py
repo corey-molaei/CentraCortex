@@ -5,6 +5,7 @@ from app.schemas.connectors.common import ConnectorStatus
 
 class GoogleAccountCreate(BaseModel):
     label: str | None = None
+    google_account_email: str | None = None
     enabled: bool = True
     is_workspace_default: bool = False
     gmail_enabled: bool = True

@@ -36,10 +36,14 @@ export function GoogleConnectorPage() {
   const [runs, setRuns] = useState<SyncRun[]>([]);
 
   const [newLabel, setNewLabel] = useState("");
+  const [newGoogleAccountEmail, setNewGoogleAccountEmail] = useState("");
   const [newEnabled, setNewEnabled] = useState(true);
   const [newGmailEnabled, setNewGmailEnabled] = useState(true);
   const [newGmailLabels, setNewGmailLabels] = useState("INBOX,SENT");
   const [newCalendarEnabled, setNewCalendarEnabled] = useState(true);
+  const [newDriveEnabled, setNewDriveEnabled] = useState(false);
+  const [newSheetsEnabled, setNewSheetsEnabled] = useState(false);
+  const [newContactsEnabled, setNewContactsEnabled] = useState(false);
 
   const [availableCalendarsByAccount, setAvailableCalendarsByAccount] = useState<Record<string, GoogleCalendarListItem[]>>({});
   const [availableFoldersByAccount, setAvailableFoldersByAccount] = useState<Record<string, FolderItem[]>>({});
@@ -58,11 +62,14 @@ export function GoogleConnectorPage() {
 
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [creatingAccount, setCreatingAccount] = useState(false);
+  const [connectingAccountId, setConnectingAccountId] = useState<string | null>(null);
 
   const redirectUri = useMemo(() => `${window.location.origin}/connectors/google`, []);
   const selectedAccount = accounts.find((account) => account.id === selectedAccountId) ?? null;
 
   const errorMessage = (err: unknown, fallback: string) => (err instanceof Error ? err.message : fallback);
+  const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
   function updateLocalAccount(accountId: string, patch: Partial<GoogleAccountRead>) {
     setAccounts((prev) => prev.map((account) => (account.id === accountId ? { ...account, ...patch } : account)));
@@ -186,22 +193,47 @@ export function GoogleConnectorPage() {
       .catch((err) => setError(errorMessage(err, "Google OAuth callback failed")));
   }, []);
 
-  async function onCreateAccount(event: FormEvent) {
-    event.preventDefault();
-    await runAction(async () => {
+  async function createAccountAndMaybeConnect(connectAfterCreate: boolean) {
+    if (creatingAccount) return;
+    const trimmedEmail = newGoogleAccountEmail.trim();
+    if (trimmedEmail && !EMAIL_RE.test(trimmedEmail)) {
+      setError("Google account email must be a valid email address.");
+      return;
+    }
+    setCreatingAccount(true);
+    setError(null);
+    try {
       const created = await createGoogleAccount({
         label: newLabel.trim() || null,
+        google_account_email: trimmedEmail || null,
         enabled: newEnabled,
         gmail_enabled: newGmailEnabled,
         gmail_labels: newGmailLabels.split(",").map((value) => value.trim()).filter(Boolean),
         calendar_enabled: newCalendarEnabled,
+        drive_enabled: newDriveEnabled,
+        sheets_enabled: newSheetsEnabled,
+        contacts_enabled: newContactsEnabled,
         calendar_ids: ["primary"],
         sync_scope_configured: false
       });
-      setMessage("Google account added. Configure sync scope before running sync.");
       await loadAccounts();
       setSelectedAccountId(created.id);
-    }, "Failed to add Google account");
+      if (connectAfterCreate) {
+        const oauth = await googleOAuthStart(created.id, redirectUri, trimmedEmail || created.google_account_email || undefined);
+        window.location.href = oauth.auth_url;
+        return;
+      }
+      setMessage("Google account added. Click Connect to sign in with Google.");
+    } catch (err) {
+      setError(errorMessage(err, "Failed to add Google account"));
+    } finally {
+      setCreatingAccount(false);
+    }
+  }
+
+  async function onCreateAccount(event: FormEvent) {
+    event.preventDefault();
+    await createAccountAndMaybeConnect(false);
   }
 
   async function onSaveAccount(account: GoogleAccountRead) {
@@ -263,6 +295,28 @@ export function GoogleConnectorPage() {
       updateLocalAccount(account.id, { ...updated, sync_scope_configured: true });
       await loadAccounts();
     }, "Failed to save sync scope");
+  }
+
+  async function onConnectAccount(account: GoogleAccountRead) {
+    if (connectingAccountId) return;
+    setError(null);
+    setConnectingAccountId(account.id);
+    try {
+      await updateGoogleAccount(account.id, {
+        gmail_enabled: account.gmail_enabled,
+        calendar_enabled: account.calendar_enabled,
+        drive_enabled: account.drive_enabled,
+        sheets_enabled: account.sheets_enabled,
+        contacts_enabled: account.contacts_enabled
+      });
+      setMessage("Permissions updated. Redirecting to Google consent.");
+      const oauth = await googleOAuthStart(account.id, redirectUri, account.google_account_email || undefined);
+      window.location.href = oauth.auth_url;
+    } catch (err) {
+      setError(errorMessage(err, "Failed to start Google OAuth"));
+    } finally {
+      setConnectingAccountId((current) => (current === account.id ? null : current));
+    }
   }
 
   useEffect(() => {
@@ -331,12 +385,19 @@ export function GoogleConnectorPage() {
           />
           <input
             className="w-full rounded border border-slate-700 bg-slate-900 p-2"
+            onChange={(e) => setNewGoogleAccountEmail(e.target.value)}
+            placeholder="Google account email (optional)"
+            value={newGoogleAccountEmail}
+          />
+          <input
+            className="w-full rounded border border-slate-700 bg-slate-900 p-2"
             onChange={(e) => setNewGmailLabels(e.target.value)}
             placeholder="Gmail labels, e.g. INBOX,SENT"
             value={newGmailLabels}
           />
           <p className="w-full rounded border border-slate-700 bg-slate-900 p-2 text-sm text-slate-300">
-            Calendars are discovered after connect. Sync scope is required before running sync.
+            Calendars are discovered after connect. Use "Add & Connect Google" to open Google sign-in immediately.
+            The optional email is used as Google login hint.
           </p>
           <div className="flex flex-wrap items-center gap-3 text-sm">
             <label className="flex items-center gap-2">
@@ -348,9 +409,30 @@ export function GoogleConnectorPage() {
             <label className="flex items-center gap-2">
               <input checked={newCalendarEnabled} onChange={(e) => setNewCalendarEnabled(e.target.checked)} type="checkbox" /> Calendar
             </label>
+            <label className="flex items-center gap-2">
+              <input checked={newDriveEnabled} onChange={(e) => setNewDriveEnabled(e.target.checked)} type="checkbox" /> Drive
+            </label>
+            <label className="flex items-center gap-2">
+              <input checked={newSheetsEnabled} onChange={(e) => setNewSheetsEnabled(e.target.checked)} type="checkbox" /> Sheets
+            </label>
+            <label className="flex items-center gap-2">
+              <input checked={newContactsEnabled} onChange={(e) => setNewContactsEnabled(e.target.checked)} type="checkbox" /> Contacts
+            </label>
           </div>
           <div className="md:col-span-2">
-            <button className="rounded bg-accent px-4 py-2 font-semibold text-slate-950" type="submit">Add Account</button>
+            <div className="flex flex-wrap gap-2">
+              <button className="rounded bg-accent px-4 py-2 font-semibold text-slate-950 disabled:cursor-not-allowed disabled:opacity-60" disabled={creatingAccount} type="submit">
+                {creatingAccount ? "Adding..." : "Add Account"}
+              </button>
+              <button
+                className="rounded border border-slate-700 px-4 py-2 font-semibold disabled:cursor-not-allowed disabled:opacity-60"
+                disabled={creatingAccount}
+                onClick={() => void createAccountAndMaybeConnect(true)}
+                type="button"
+              >
+                {creatingAccount ? "Adding..." : "Add & Connect Google"}
+              </button>
+            </div>
           </div>
         </form>
       </section>
@@ -729,16 +811,15 @@ export function GoogleConnectorPage() {
               <div className="mt-3 flex flex-wrap gap-2">
                 <button
                   className="rounded border border-slate-700 px-3 py-2"
-                  onClick={() =>
-                    void runAction(async () => {
-                      const oauth = await googleOAuthStart(account.id, redirectUri);
-                      window.location.href = oauth.auth_url;
-                    }, "Failed to start Google OAuth")
-                  }
+                  disabled={connectingAccountId !== null}
+                  onClick={() => void onConnectAccount(account)}
                   type="button"
                 >
-                  {account.is_oauth_connected ? "Reconnect" : "Connect"}
+                  {connectingAccountId === account.id ? "Connecting..." : account.is_oauth_connected ? "Reconnect" : "Connect"}
                 </button>
+                <span className="self-center text-xs text-slate-400">
+                  Reconnect after changing capability checkboxes to update requested permissions.
+                </span>
                 <button className="rounded border border-slate-700 px-3 py-2" onClick={() => void onSaveAccount(account)} type="button">Save</button>
                 <button
                   className={`rounded border border-slate-700 px-3 py-2 ${account.is_primary ? "opacity-60" : ""}`}

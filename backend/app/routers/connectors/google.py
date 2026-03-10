@@ -1,5 +1,6 @@
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_tenant_membership, get_db
@@ -44,6 +45,7 @@ from app.services.connectors.google_service import (
 )
 
 router = APIRouter(prefix="/connectors/google", tags=["connectors-google"])
+logger = structlog.get_logger(__name__)
 
 
 def _ensure_oauth_settings() -> tuple[str, str]:
@@ -159,6 +161,35 @@ def create_google_account(
     membership: TenantMembership = Depends(get_current_tenant_membership),
     db: Session = Depends(get_db),
 ):
+    normalized_email = payload.google_account_email.strip().lower() if payload.google_account_email else None
+    if normalized_email:
+        existing_by_email = db.execute(
+            select(GoogleUserConnector).where(
+                GoogleUserConnector.tenant_id == membership.tenant_id,
+                GoogleUserConnector.user_id == membership.user_id,
+                func.lower(GoogleUserConnector.google_account_email) == normalized_email,
+            )
+        ).scalar_one_or_none()
+        if existing_by_email is not None:
+            if payload.label is not None:
+                existing_by_email.label = payload.label
+            existing_by_email.google_account_email = normalized_email
+            existing_by_email.gmail_enabled = payload.gmail_enabled
+            existing_by_email.calendar_enabled = payload.calendar_enabled
+            existing_by_email.drive_enabled = payload.drive_enabled
+            existing_by_email.sheets_enabled = payload.sheets_enabled
+            existing_by_email.contacts_enabled = payload.contacts_enabled
+            db.commit()
+            db.refresh(existing_by_email)
+            logger.info(
+                "google_account_create_idempotent_hit",
+                tenant_id=membership.tenant_id,
+                user_id=membership.user_id,
+                account_id=existing_by_email.id,
+                google_account_email=normalized_email,
+            )
+            return _read_model(existing_by_email)
+
     existing_primary = db.execute(
         select(GoogleUserConnector.id).where(
             GoogleUserConnector.tenant_id == membership.tenant_id,
@@ -178,6 +209,7 @@ def create_google_account(
         tenant_id=membership.tenant_id,
         user_id=membership.user_id,
         label=payload.label,
+        google_account_email=normalized_email,
         enabled=payload.enabled,
         is_primary=existing_primary is None,
         is_workspace_default=payload.is_workspace_default or existing_workspace_default is None,
@@ -321,6 +353,7 @@ def delete_google_account(
 def google_oauth_start(
     account_id: str,
     redirect_uri: str = Query(...),
+    login_hint: str | None = Query(default=None),
     membership: TenantMembership = Depends(get_current_tenant_membership),
     db: Session = Depends(get_db),
 ):
@@ -332,6 +365,7 @@ def google_oauth_start(
         client_id=client_id,
         redirect_uri=redirect_uri,
         user_id=membership.user_id,
+        login_hint=login_hint,
     )
     return OAuthStartResponse(auth_url=auth_url, state=state)
 
@@ -364,7 +398,7 @@ def google_oauth_callback(
     account = _get_owned_account(db, membership, state_row.connector_config_id)
 
     try:
-        complete_oauth(
+        effective_account = complete_oauth(
             db,
             account,
             code=code,
@@ -383,11 +417,11 @@ def google_oauth_callback(
         action="connect",
         tenant_id=membership.tenant_id,
         user_id=membership.user_id,
-        resource_id=account.id,
+        resource_id=effective_account.id,
         request_id=request.headers.get("X-Request-ID"),
         payload={
-            "account_id": account.id,
-            "google_account_email": account.google_account_email,
+            "account_id": effective_account.id,
+            "google_account_email": effective_account.google_account_email,
         },
     )
     return {"message": "Google OAuth completed"}

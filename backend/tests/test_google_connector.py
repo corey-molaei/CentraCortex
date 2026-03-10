@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from sqlalchemy import select
@@ -61,17 +62,33 @@ def _auth(token: str, tenant_id: str) -> dict[str, str]:
     }
 
 
-def _create_account(client, token: str, tenant_id: str, *, label: str = "Work") -> str:
+def _create_account(
+    client,
+    token: str,
+    tenant_id: str,
+    *,
+    label: str = "Work",
+    google_account_email: str | None = None,
+    gmail_enabled: bool = True,
+    calendar_enabled: bool = True,
+    drive_enabled: bool = False,
+    sheets_enabled: bool = False,
+    contacts_enabled: bool = False,
+) -> str:
     response = client.post(
         "/api/v1/connectors/google/accounts",
         headers=_auth(token, tenant_id),
         json={
             "label": label,
+            "google_account_email": google_account_email,
             "enabled": True,
-            "gmail_enabled": True,
+            "gmail_enabled": gmail_enabled,
             "gmail_labels": ["INBOX", "SENT"],
-            "calendar_enabled": True,
+            "calendar_enabled": calendar_enabled,
             "calendar_ids": ["primary"],
+            "drive_enabled": drive_enabled,
+            "sheets_enabled": sheets_enabled,
+            "contacts_enabled": contacts_enabled,
             "sync_scope_configured": True,
         },
     )
@@ -168,6 +185,283 @@ def test_google_oauth_callback_is_bound_to_user_and_account(client, db_session):
         params={"code": "oauth-code", "state": state},
     )
     assert forbidden.status_code == 403
+
+
+def test_create_google_account_stores_optional_email(client, db_session):
+    tenant = _seed_tenant(db_session, slug="google-account-email")
+    user = _seed_user(db_session, tenant=tenant, email="hint@example.com", is_default=True)
+    token = _login(client, email=user.email)
+
+    response = client.post(
+        "/api/v1/connectors/google/accounts",
+        headers=_auth(token, tenant.id),
+        json={
+            "label": "Hinted",
+            "google_account_email": "owner@example.com",
+            "enabled": True,
+            "gmail_enabled": True,
+            "gmail_labels": ["INBOX"],
+            "calendar_enabled": True,
+            "calendar_ids": ["primary"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["google_account_email"] == "owner@example.com"
+
+
+def test_create_google_account_is_idempotent_for_same_email_hint(client, db_session):
+    tenant = _seed_tenant(db_session, slug="google-account-idempotent-email")
+    user = _seed_user(db_session, tenant=tenant, email="idem@example.com", is_default=True)
+    token = _login(client, email=user.email)
+
+    first = client.post(
+        "/api/v1/connectors/google/accounts",
+        headers=_auth(token, tenant.id),
+        json={
+            "label": "Primary Label",
+            "google_account_email": "Owner@Example.com",
+            "enabled": True,
+            "gmail_enabled": True,
+            "gmail_labels": ["INBOX"],
+            "calendar_enabled": True,
+            "calendar_ids": ["primary"],
+            "drive_enabled": False,
+            "sheets_enabled": False,
+            "contacts_enabled": False,
+        },
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/api/v1/connectors/google/accounts",
+        headers=_auth(token, tenant.id),
+        json={
+            "label": "Updated Label",
+            "google_account_email": "owner@example.com",
+            "enabled": True,
+            "gmail_enabled": True,
+            "gmail_labels": ["INBOX"],
+            "calendar_enabled": True,
+            "calendar_ids": ["primary"],
+            "drive_enabled": True,
+            "sheets_enabled": True,
+            "contacts_enabled": True,
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["label"] == "Updated Label"
+    assert second.json()["drive_enabled"] is True
+    assert second.json()["sheets_enabled"] is True
+    assert second.json()["contacts_enabled"] is True
+
+    rows = db_session.execute(
+        select(GoogleUserConnector).where(
+            GoogleUserConnector.tenant_id == tenant.id,
+            GoogleUserConnector.user_id == user.id,
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+
+
+def test_google_oauth_start_uses_hint_and_scopes_from_capabilities(client, db_session):
+    tenant = _seed_tenant(db_session, slug="google-oauth-scopes")
+    user = _seed_user(db_session, tenant=tenant, email="scopes@example.com", is_default=True)
+    token = _login(client, email=user.email)
+
+    account_id = _create_account(
+        client,
+        token,
+        tenant.id,
+        label="Capabilities",
+        google_account_email="stored@example.com",
+        gmail_enabled=True,
+        calendar_enabled=True,
+        drive_enabled=False,
+        sheets_enabled=False,
+        contacts_enabled=False,
+    )
+
+    started = client.get(
+        f"/api/v1/connectors/google/accounts/{account_id}/oauth/start",
+        headers=_auth(token, tenant.id),
+        params={
+            "redirect_uri": "http://localhost:5173/connectors/google",
+            "login_hint": "override@example.com",
+        },
+    )
+    assert started.status_code == 200
+    auth_url = started.json()["auth_url"]
+    query = parse_qs(urlparse(auth_url).query)
+    scopes = set(query["scope"][0].split())
+    assert query.get("login_hint") == ["override@example.com"]
+    assert "openid" in scopes
+    assert "profile" in scopes
+    assert "email" in scopes
+    assert "https://www.googleapis.com/auth/gmail.readonly" in scopes
+    assert "https://www.googleapis.com/auth/gmail.modify" in scopes
+    assert "https://www.googleapis.com/auth/calendar" in scopes
+    assert "https://www.googleapis.com/auth/calendar.events" in scopes
+    assert "https://www.googleapis.com/auth/drive.readonly" not in scopes
+    assert "https://www.googleapis.com/auth/spreadsheets" not in scopes
+    assert "https://www.googleapis.com/auth/contacts.readonly" not in scopes
+
+
+def test_google_oauth_start_includes_contacts_scope_when_enabled(client, db_session):
+    tenant = _seed_tenant(db_session, slug="google-oauth-contacts-scope")
+    user = _seed_user(db_session, tenant=tenant, email="contacts-scope@example.com", is_default=True)
+    token = _login(client, email=user.email)
+
+    account_id = _create_account(
+        client,
+        token,
+        tenant.id,
+        label="Contacts Enabled",
+        google_account_email="stored@example.com",
+        gmail_enabled=True,
+        calendar_enabled=True,
+        drive_enabled=True,
+        sheets_enabled=True,
+        contacts_enabled=True,
+    )
+
+    started = client.get(
+        f"/api/v1/connectors/google/accounts/{account_id}/oauth/start",
+        headers=_auth(token, tenant.id),
+        params={"redirect_uri": "http://localhost:5173/connectors/google"},
+    )
+    assert started.status_code == 200
+    auth_url = started.json()["auth_url"]
+    query = parse_qs(urlparse(auth_url).query)
+    scopes = set(query["scope"][0].split())
+    assert query.get("login_hint") == ["stored@example.com"]
+    assert "https://www.googleapis.com/auth/drive.readonly" in scopes
+    assert "https://www.googleapis.com/auth/spreadsheets" in scopes
+    assert "https://www.googleapis.com/auth/contacts.readonly" in scopes
+
+
+def test_google_oauth_callback_merges_duplicate_sub_accounts(client, db_session, monkeypatch):
+    tenant = _seed_tenant(db_session, slug="google-oauth-duplicate-sub")
+    user = _seed_user(db_session, tenant=tenant, email="dup-sub@example.com", is_default=True)
+    token = _login(client, email=user.email)
+
+    connected_id = _create_account(
+        client,
+        token,
+        tenant.id,
+        label="Connected",
+        google_account_email="connected@example.com",
+        drive_enabled=False,
+        sheets_enabled=False,
+        contacts_enabled=False,
+    )
+    duplicate_id = _create_account(
+        client,
+        token,
+        tenant.id,
+        label="Duplicate Candidate",
+        google_account_email="duplicate@example.com",
+        drive_enabled=True,
+        sheets_enabled=True,
+        contacts_enabled=True,
+    )
+
+    connected = db_session.get(GoogleUserConnector, connected_id)
+    assert connected is not None
+    connected.google_account_sub = "sub-duplicate"
+    connected.access_token_encrypted = encrypt_secret("old-access")
+    connected.refresh_token_encrypted = encrypt_secret("old-refresh")
+    connected.token_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    db_session.commit()
+
+    started = client.get(
+        f"/api/v1/connectors/google/accounts/{duplicate_id}/oauth/start",
+        headers=_auth(token, tenant.id),
+        params={"redirect_uri": "http://localhost:5173/connectors/google"},
+    )
+    assert started.status_code == 200
+    state = started.json()["state"]
+
+    monkeypatch.setattr(
+        "app.services.connectors.google_service._exchange_token",
+        lambda data: {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+            "scope": "openid profile email https://www.googleapis.com/auth/drive.readonly",
+        },
+    )
+
+    def _fake_google_request(**kwargs):
+        if kwargs["method"] == "GET" and kwargs["url"].endswith("/userinfo"):
+            return {"id": "sub-duplicate", "email": "connected@example.com"}
+        raise AssertionError(f"Unexpected Google request in test: {kwargs}")
+
+    monkeypatch.setattr("app.services.connectors.google_service._google_request", _fake_google_request)
+
+    callback = client.get(
+        "/api/v1/connectors/google/oauth/callback",
+        headers=_auth(token, tenant.id),
+        params={"code": "oauth-code", "state": state},
+    )
+    assert callback.status_code == 200
+
+    listed = client.get("/api/v1/connectors/google/accounts", headers=_auth(token, tenant.id))
+    assert listed.status_code == 200
+    accounts = listed.json()
+    assert len(accounts) == 1
+    assert accounts[0]["id"] == connected_id
+    assert accounts[0]["google_account_sub"] == "sub-duplicate"
+    assert accounts[0]["google_account_email"] == "connected@example.com"
+    assert accounts[0]["drive_enabled"] is True
+    assert accounts[0]["sheets_enabled"] is True
+    assert accounts[0]["contacts_enabled"] is True
+
+
+def test_google_oauth_callback_normal_path_still_succeeds(client, db_session, monkeypatch):
+    tenant = _seed_tenant(db_session, slug="google-oauth-normal-path")
+    user = _seed_user(db_session, tenant=tenant, email="normal-oauth@example.com", is_default=True)
+    token = _login(client, email=user.email)
+    account_id = _create_account(client, token, tenant.id, label="Normal")
+
+    started = client.get(
+        f"/api/v1/connectors/google/accounts/{account_id}/oauth/start",
+        headers=_auth(token, tenant.id),
+        params={"redirect_uri": "http://localhost:5173/connectors/google"},
+    )
+    assert started.status_code == 200
+    state = started.json()["state"]
+
+    monkeypatch.setattr(
+        "app.services.connectors.google_service._exchange_token",
+        lambda data: {
+            "access_token": "fresh-access",
+            "refresh_token": "fresh-refresh",
+            "expires_in": 3600,
+            "scope": "openid profile email https://www.googleapis.com/auth/gmail.readonly",
+        },
+    )
+
+    def _fake_google_request(**kwargs):
+        if kwargs["method"] == "GET" and kwargs["url"].endswith("/userinfo"):
+            return {"id": "sub-normal", "email": "normal-oauth@example.com"}
+        raise AssertionError(f"Unexpected Google request in test: {kwargs}")
+
+    monkeypatch.setattr("app.services.connectors.google_service._google_request", _fake_google_request)
+
+    callback = client.get(
+        "/api/v1/connectors/google/oauth/callback",
+        headers=_auth(token, tenant.id),
+        params={"code": "oauth-code", "state": state},
+    )
+    assert callback.status_code == 200
+
+    listed = client.get("/api/v1/connectors/google/accounts", headers=_auth(token, tenant.id))
+    assert listed.status_code == 200
+    accounts = listed.json()
+    assert len(accounts) == 1
+    assert accounts[0]["id"] == account_id
+    assert accounts[0]["google_account_sub"] == "sub-normal"
 
 
 def test_google_account_actions_are_user_scoped(client, db_session):

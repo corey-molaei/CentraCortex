@@ -7,7 +7,9 @@ from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlencode
 
 import httpx
+import structlog
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -27,6 +29,7 @@ GOOGLE_CALENDAR_BASE_URL = "https://www.googleapis.com/calendar/v3"
 GOOGLE_DRIVE_BASE_URL = "https://www.googleapis.com/drive/v3"
 GOOGLE_SHEETS_BASE_URL = "https://sheets.googleapis.com/v4/spreadsheets"
 GOOGLE_PEOPLE_BASE_URL = "https://people.googleapis.com/v1"
+logger = structlog.get_logger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -50,6 +53,35 @@ def _configured_scopes() -> list[str]:
         if chunk and chunk not in scopes:
             scopes.append(chunk)
     return scopes
+
+
+def _oauth_scopes_for_connector(connector: GoogleUserConnector) -> list[str]:
+    scopes: list[str] = [
+        "openid",
+        "profile",
+        "email",
+    ]
+    if connector.gmail_enabled:
+        scopes.extend(
+            [
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.modify",
+            ]
+        )
+    if connector.calendar_enabled:
+        scopes.extend(
+            [
+                "https://www.googleapis.com/auth/calendar",
+                "https://www.googleapis.com/auth/calendar.events",
+            ]
+        )
+    if connector.drive_enabled:
+        scopes.append("https://www.googleapis.com/auth/drive.readonly")
+    if connector.sheets_enabled:
+        scopes.append("https://www.googleapis.com/auth/spreadsheets")
+    if connector.contacts_enabled:
+        scopes.append("https://www.googleapis.com/auth/contacts.readonly")
+    return list(dict.fromkeys(scopes))
 
 
 def _parse_google_datetime(value: str | None) -> datetime | None:
@@ -168,6 +200,86 @@ def _account_resource_id(account_id: str) -> str:
     return f"google_account:{account_id}"
 
 
+def _copy_connector_capability_settings(*, source: GoogleUserConnector, target: GoogleUserConnector) -> None:
+    target.gmail_enabled = source.gmail_enabled
+    target.gmail_labels = list(source.gmail_labels or [])
+    target.gmail_sync_mode = source.gmail_sync_mode
+    target.gmail_last_n_days = source.gmail_last_n_days
+    target.gmail_max_messages = source.gmail_max_messages
+    target.gmail_query = source.gmail_query
+
+    target.calendar_enabled = source.calendar_enabled
+    target.calendar_ids = list(source.calendar_ids or [])
+    target.calendar_sync_mode = source.calendar_sync_mode
+    target.calendar_days_back = source.calendar_days_back
+    target.calendar_days_forward = source.calendar_days_forward
+    target.calendar_max_events = source.calendar_max_events
+
+    target.drive_enabled = source.drive_enabled
+    target.drive_folder_ids = list(source.drive_folder_ids or [])
+    target.drive_file_ids = list(source.drive_file_ids or [])
+
+    target.sheets_enabled = source.sheets_enabled
+    target.sheets_targets = list(source.sheets_targets or [])
+
+    target.contacts_enabled = source.contacts_enabled
+    target.contacts_sync_mode = source.contacts_sync_mode
+    target.contacts_group_ids = list(source.contacts_group_ids or [])
+    target.contacts_max_count = source.contacts_max_count
+
+    target.meet_enabled = source.meet_enabled
+    target.sync_scope_configured = source.sync_scope_configured
+    target.enabled = source.enabled
+    target.crm_sheet_spreadsheet_id = source.crm_sheet_spreadsheet_id
+    target.crm_sheet_tab_name = source.crm_sheet_tab_name
+    if source.label:
+        target.label = source.label
+    if source.google_account_email:
+        target.google_account_email = source.google_account_email
+
+
+def _apply_oauth_result_to_connector(
+    *,
+    connector: GoogleUserConnector,
+    access_token: str,
+    refresh_token: str | None,
+    token_payload: dict,
+    profile: dict,
+) -> None:
+    connector.access_token_encrypted = encrypt_secret(access_token)
+    if refresh_token:
+        connector.refresh_token_encrypted = encrypt_secret(refresh_token)
+    connector.token_expires_at = _utcnow() + timedelta(seconds=int(token_payload.get("expires_in", 3600)))
+    connector.scopes = str(token_payload.get("scope", "")).split() or _oauth_scopes_for_connector(connector)
+    connector.google_account_email = str(profile.get("email") or "") or None
+    connector.google_account_sub = str(profile.get("id") or "") or None
+
+
+def _normalize_default_flags(db: Session, *, connector: GoogleUserConnector, source: GoogleUserConnector) -> None:
+    if connector.user_id == source.user_id and source.is_primary:
+        others = db.execute(
+            select(GoogleUserConnector).where(
+                GoogleUserConnector.tenant_id == connector.tenant_id,
+                GoogleUserConnector.user_id == connector.user_id,
+                GoogleUserConnector.id != connector.id,
+            )
+        ).scalars().all()
+        for other in others:
+            other.is_primary = False
+        connector.is_primary = True
+
+    if source.is_workspace_default:
+        others = db.execute(
+            select(GoogleUserConnector).where(
+                GoogleUserConnector.tenant_id == connector.tenant_id,
+                GoogleUserConnector.id != connector.id,
+            )
+        ).scalars().all()
+        for other in others:
+            other.is_workspace_default = False
+        connector.is_workspace_default = True
+
+
 def ensure_private_acl_policy(db: Session, connector: GoogleUserConnector) -> str:
     if connector.private_acl_policy_id:
         existing = db.get(ACLPolicy, connector.private_acl_policy_id)
@@ -215,6 +327,7 @@ def get_oauth_url(
     client_id: str,
     redirect_uri: str,
     user_id: str,
+    login_hint: str | None = None,
 ) -> tuple[str, str]:
     state = random_token(16)
     db.add(
@@ -230,18 +343,20 @@ def get_oauth_url(
     )
     db.commit()
 
-    params = urlencode(
-        {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "response_type": "code",
-            "scope": " ".join(_configured_scopes()),
-            "access_type": "offline",
-            "include_granted_scopes": "true",
-            "prompt": "consent",
-            "state": state,
-        }
-    )
+    auth_params: dict[str, str] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(_oauth_scopes_for_connector(connector)),
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+        "state": state,
+    }
+    effective_login_hint = (login_hint or connector.google_account_email or "").strip()
+    if effective_login_hint:
+        auth_params["login_hint"] = effective_login_hint
+    params = urlencode(auth_params)
     return f"{GOOGLE_OAUTH_URL}?{params}", state
 
 
@@ -254,7 +369,7 @@ def complete_oauth(
     client_id: str,
     client_secret: str,
     user_id: str,
-) -> None:
+) -> GoogleUserConnector:
     state_row = db.execute(
         select(ConnectorOAuthState).where(
             ConnectorOAuthState.tenant_id == connector.tenant_id,
@@ -286,20 +401,106 @@ def complete_oauth(
         raise ValueError("Google token exchange did not return an access token")
 
     profile = _google_request(method="GET", access_token=access_token, url=GOOGLE_USERINFO_URL)
-
-    connector.access_token_encrypted = encrypt_secret(access_token)
     refresh_token = token_payload.get("refresh_token")
-    if refresh_token:
-        connector.refresh_token_encrypted = encrypt_secret(refresh_token)
-    connector.token_expires_at = _utcnow() + timedelta(seconds=int(token_payload.get("expires_in", 3600)))
-    connector.scopes = str(token_payload.get("scope", "")).split() or _configured_scopes()
-    connector.google_account_email = str(profile.get("email") or "") or None
-    connector.google_account_sub = str(profile.get("id") or "") or None
+    profile_sub = str(profile.get("id") or "") or None
+    if not profile_sub:
+        raise ValueError("Google profile did not include account identity")
 
-    ensure_private_acl_policy(db, connector)
+    existing_by_sub = db.execute(
+        select(GoogleUserConnector).where(
+            GoogleUserConnector.tenant_id == connector.tenant_id,
+            GoogleUserConnector.user_id == connector.user_id,
+            GoogleUserConnector.google_account_sub == profile_sub,
+            GoogleUserConnector.id != connector.id,
+        )
+    ).scalar_one_or_none()
 
-    db.delete(state_row)
-    db.commit()
+    source_connector = connector
+    target_connector = connector
+    if existing_by_sub is not None:
+        _copy_connector_capability_settings(source=connector, target=existing_by_sub)
+        _normalize_default_flags(db, connector=existing_by_sub, source=connector)
+        target_connector = existing_by_sub
+
+    _apply_oauth_result_to_connector(
+        connector=target_connector,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_payload=token_payload,
+        profile=profile,
+    )
+
+    try:
+        ensure_private_acl_policy(db, target_connector)
+        if source_connector.id != target_connector.id:
+            db.delete(source_connector)
+            logger.info(
+                "google_oauth_duplicate_sub_merged",
+                tenant_id=connector.tenant_id,
+                user_id=connector.user_id,
+                source_account_id=source_connector.id,
+                target_account_id=target_connector.id,
+                google_account_sub=profile_sub,
+            )
+        db.delete(state_row)
+        db.commit()
+        db.refresh(target_connector)
+        return target_connector
+    except IntegrityError as exc:
+        db.rollback()
+        candidate = db.execute(
+            select(GoogleUserConnector).where(
+                GoogleUserConnector.tenant_id == connector.tenant_id,
+                GoogleUserConnector.user_id == connector.user_id,
+                GoogleUserConnector.google_account_sub == profile_sub,
+            )
+        ).scalar_one_or_none()
+        if candidate is None:
+            logger.warning(
+                "google_oauth_duplicate_sub_cleanup_failed",
+                tenant_id=connector.tenant_id,
+                user_id=connector.user_id,
+                source_account_id=connector.id,
+                google_account_sub=profile_sub,
+                error=str(exc),
+            )
+            raise ValueError("Failed to connect Google account due to duplicate account conflict. Please retry.") from exc
+
+        source_after_rollback = db.get(GoogleUserConnector, connector.id)
+        if source_after_rollback is not None and source_after_rollback.id != candidate.id:
+            _copy_connector_capability_settings(source=source_after_rollback, target=candidate)
+            _normalize_default_flags(db, connector=candidate, source=source_after_rollback)
+            db.delete(source_after_rollback)
+        _apply_oauth_result_to_connector(
+            connector=candidate,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            token_payload=token_payload,
+            profile=profile,
+        )
+        ensure_private_acl_policy(db, candidate)
+        fresh_state = db.execute(
+            select(ConnectorOAuthState).where(
+                ConnectorOAuthState.tenant_id == connector.tenant_id,
+                ConnectorOAuthState.user_id == user_id,
+                ConnectorOAuthState.connector_type == "google",
+                ConnectorOAuthState.state_token == state,
+            )
+        ).scalar_one_or_none()
+        if fresh_state is not None:
+            db.delete(fresh_state)
+        db.commit()
+        db.refresh(candidate)
+        logger.info(
+            "google_oauth_duplicate_sub_merged",
+            tenant_id=connector.tenant_id,
+            user_id=connector.user_id,
+            source_account_id=connector.id,
+            target_account_id=candidate.id,
+            google_account_sub=profile_sub,
+            recovered_from_integrity_error=True,
+        )
+        return candidate
 
 
 def refresh_access_token(db: Session, connector: GoogleUserConnector, *, client_id: str, client_secret: str) -> str:

@@ -74,6 +74,7 @@ export function slackOAuthCallback(code: string, state: string) {
 
 export type GoogleAccountPayload = {
   label?: string | null;
+  google_account_email?: string | null;
   enabled: boolean;
   is_primary?: boolean;
   is_workspace_default?: boolean;
@@ -231,10 +232,15 @@ export function deleteGoogleAccount(accountId: string) {
   );
 }
 
-export function googleOAuthStart(accountId: string, redirectUri: string) {
-  const encoded = encodeURIComponent(redirectUri);
+export function googleOAuthStart(accountId: string, redirectUri: string, loginHint?: string) {
+  const params = new URLSearchParams();
+  params.set("redirect_uri", redirectUri);
+  const trimmedHint = loginHint?.trim();
+  if (trimmedHint) {
+    params.set("login_hint", trimmedHint);
+  }
   return request<{ auth_url: string; state: string }>(
-    `/api/v1/connectors/google/accounts/${encodeURIComponent(accountId)}/oauth/start?redirect_uri=${encoded}`
+    `/api/v1/connectors/google/accounts/${encodeURIComponent(accountId)}/oauth/start?${params.toString()}`
   );
 }
 
