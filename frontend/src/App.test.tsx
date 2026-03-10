@@ -70,6 +70,7 @@ describe("App routing", () => {
       </MemoryRouter>
     );
 
-    expect(screen.getByText("Google (Gmail + Calendar)")).toBeInTheDocument();
+    const googleLinks = screen.getAllByRole("link", { name: /google/i });
+    expect(googleLinks.some((link) => link.getAttribute("href") === "/connectors/google")).toBe(true);
   });
 });

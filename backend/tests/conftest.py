@@ -2,6 +2,7 @@ import os
 
 import pytest
 from fastapi.testclient import TestClient
+from qdrant_client import QdrantClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -53,3 +54,17 @@ def client(db_session):
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def local_qdrant_for_tests(monkeypatch, tmp_path):
+    from app.services import document_indexing
+
+    client = QdrantClient(path=str(tmp_path / "qdrant"))
+    monkeypatch.setattr(document_indexing, "_qdrant_client", lambda: client)
+    try:
+        yield
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()

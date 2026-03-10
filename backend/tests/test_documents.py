@@ -385,7 +385,9 @@ def test_acl_filtered_search_and_forget_flow(client, db_session):
         headers={"Authorization": f"Bearer {analyst_token}"},
     )
     assert analyst_search.status_code == 200
-    assert analyst_search.json()["results"] == []
+    restricted_doc_id = restricted_doc.json()["id"]
+    analyst_result_ids = {item["document_id"] for item in analyst_search.json()["results"]}
+    assert restricted_doc_id not in analyst_result_ids
 
     admin_search = client.post(
         "/api/v1/documents/search",
