@@ -4,6 +4,8 @@ import base64
 import hashlib
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from io import BytesIO
+from pathlib import Path
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -20,6 +22,16 @@ from app.models.connectors.google_user_connector import GoogleUserConnector
 from app.models.document import Document
 from app.services.connectors.common import finish_sync_run, start_sync_run, upsert_document
 from app.services.document_indexing import soft_delete_document
+
+try:
+    from docx import Document as DocxDocument
+except Exception:  # pragma: no cover
+    DocxDocument = None
+
+try:
+    from pypdf import PdfReader
+except Exception:  # pragma: no cover
+    PdfReader = None
 
 GOOGLE_OAUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -190,6 +202,90 @@ def _google_text_request(*, access_token: str, url: str, params: dict | None = N
     if response.status_code >= 400:
         raise ValueError(f"Google API text request failed: {response.text}")
     return response.text
+
+
+def _google_binary_request(*, access_token: str, url: str, params: dict | None = None) -> bytes:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    with httpx.Client(timeout=30) as client:
+        response = client.get(url, headers=headers, params=params)
+    if response.status_code >= 400:
+        raise ValueError(f"Google API binary request failed: {response.text}")
+    return response.content
+
+
+def _extract_drive_text(*, access_token: str, file_id: str, name: str, mime_type: str) -> str:
+    fallback = f"Drive file: {name}"
+    if not file_id:
+        return fallback
+
+    lower_mime = (mime_type or "").lower()
+    extension = Path(name).suffix.lower().lstrip(".")
+
+    if lower_mime == "application/vnd.google-apps.document":
+        try:
+            return _google_text_request(
+                access_token=access_token,
+                url=f"{GOOGLE_DRIVE_BASE_URL}/files/{quote(file_id, safe='')}/export",
+                params={"mimeType": "text/plain"},
+            )
+        except Exception:
+            return fallback
+
+    if lower_mime.startswith("text/") or lower_mime in {
+        "application/json",
+        "application/xml",
+        "text/csv",
+        "application/csv",
+    }:
+        try:
+            return _google_text_request(
+                access_token=access_token,
+                url=f"{GOOGLE_DRIVE_BASE_URL}/files/{quote(file_id, safe='')}",
+                params={"alt": "media"},
+            )
+        except Exception:
+            return fallback
+
+    try:
+        payload = _google_binary_request(
+            access_token=access_token,
+            url=f"{GOOGLE_DRIVE_BASE_URL}/files/{quote(file_id, safe='')}",
+            params={"alt": "media"},
+        )
+    except Exception:
+        return fallback
+
+    if not payload:
+        return fallback
+
+    if lower_mime == "application/pdf" and PdfReader is not None:
+        try:
+            reader = PdfReader(BytesIO(payload))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+            return text or fallback
+        except Exception:
+            return fallback
+
+    if (
+        lower_mime
+        in {
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/msword",
+        }
+        or extension == "docx"
+    ) and DocxDocument is not None:
+        try:
+            doc = DocxDocument(BytesIO(payload))
+            text = "\n".join(p.text for p in doc.paragraphs).strip()
+            return text or fallback
+        except Exception:
+            return fallback
+
+    if extension in {"txt", "md", "csv", "json"}:
+        decoded = payload.decode("utf-8", errors="ignore").strip()
+        return decoded or fallback
+
+    return fallback
 
 
 def _exchange_token(data: dict[str, str]) -> dict:
@@ -1135,16 +1231,12 @@ def _upsert_drive_document(
     modified_time = str(item.get("modifiedTime") or "")
     source_updated_at = _parse_google_datetime(modified_time)
 
-    raw_text = f"Drive file: {name}"
-    if mime_type == "application/vnd.google-apps.document":
-        try:
-            raw_text = _google_text_request(
-                access_token=access_token,
-                url=f"{GOOGLE_DRIVE_BASE_URL}/files/{quote(file_id, safe='')}/export",
-                params={"mimeType": "text/plain"},
-            )
-        except Exception:
-            pass
+    raw_text = _extract_drive_text(
+        access_token=access_token,
+        file_id=file_id,
+        name=name,
+        mime_type=mime_type,
+    )
 
     owner_email = None
     owners = item.get("owners") or []

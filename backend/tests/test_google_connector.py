@@ -13,6 +13,7 @@ from app.models.document import Document
 from app.models.tenant import Tenant
 from app.models.tenant_membership import TenantMembership
 from app.models.user import User
+from app.services.connectors.google_service import _extract_drive_text
 from app.tasks.celery_app import sync_google_connectors
 
 
@@ -918,3 +919,41 @@ def test_missing_google_credentials_returns_400(client, db_session, monkeypatch)
     )
     assert response.status_code == 400
     assert "GOOGLE_CLIENT_ID" in response.json()["detail"]
+
+
+def test_extract_drive_text_reads_plain_text_via_alt_media(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_text_request(*, access_token: str, url: str, params: dict | None = None) -> str:
+        captured["access_token"] = access_token
+        captured["url"] = url
+        captured["params"] = params
+        return "plain text from drive"
+
+    monkeypatch.setattr("app.services.connectors.google_service._google_text_request", fake_text_request)
+
+    extracted = _extract_drive_text(
+        access_token="token-x",
+        file_id="file-1",
+        name="notes.txt",
+        mime_type="text/plain",
+    )
+
+    assert extracted == "plain text from drive"
+    assert captured["params"] == {"alt": "media"}
+
+
+def test_extract_drive_text_falls_back_when_binary_download_fails(monkeypatch):
+    def fake_binary_request(*, access_token: str, url: str, params: dict | None = None) -> bytes:  # noqa: ARG001
+        raise ValueError("download failed")
+
+    monkeypatch.setattr("app.services.connectors.google_service._google_binary_request", fake_binary_request)
+
+    extracted = _extract_drive_text(
+        access_token="token-x",
+        file_id="file-2",
+        name="archive.zip",
+        mime_type="application/zip",
+    )
+
+    assert extracted == "Drive file: archive.zip"

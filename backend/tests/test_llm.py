@@ -12,7 +12,7 @@ from app.models.tenant import Tenant
 from app.models.tenant_codex_oauth_token import TenantCodexOAuthToken
 from app.models.tenant_membership import TenantMembership
 from app.models.user import User
-from app.services.chat_runtime import _count_overlap_tokens, _tokenize_text
+from app.services.chat_runtime import _count_overlap_tokens, _normalize_retrieval_query, _tokenize_text
 from app.services.document_indexing import _bm25_chunks
 from app.services.llm_router import LLMRouter
 
@@ -276,6 +276,16 @@ def test_codex_provider_test_connection_not_connected(client, db_session):
     assert tested.status_code == 200
     assert tested.json()["success"] is False
     assert "Codex is not connected" in tested.json()["message"]
+
+
+def test_normalize_retrieval_query_strips_conversational_prefix() -> None:
+    assert _normalize_retrieval_query("what do you know about mirror lake?") == "mirror lake"
+    assert _normalize_retrieval_query("Can you tell me about quarterly revenue trends") == "quarterly revenue trends"
+
+
+def test_normalize_retrieval_query_keeps_plain_queries() -> None:
+    assert _normalize_retrieval_query("mirror lake") == "mirror lake"
+    assert _normalize_retrieval_query("salary policy 2026") == "salary policy 2026"
 
 
 def test_codex_provider_test_connection_connected(client, db_session, monkeypatch):

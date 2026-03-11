@@ -52,6 +52,15 @@ EMAIL_SOURCE_TYPES = {"google_gmail", "imap_email"}
 CALENDAR_SOURCE_TYPES = {"google_calendar"}
 CONTACTS_SOURCE_TYPES = {"google_contacts"}
 
+RETRIEVAL_PREFIX_PATTERNS = [
+    re.compile(
+        r"^(?:what do you know about|tell me about|can you tell me about|could you tell me about|"
+        r"give me information about|give me details about|explain)\s+(.+)$",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(r"^(?:what is|what's)\s+(.+)$", flags=re.IGNORECASE),
+]
+
 
 @dataclass
 class SafetyDecision:
@@ -318,6 +327,21 @@ def _tokenize_text(value: str) -> set[str]:
     return {token for token in re.findall(r"[a-z0-9_]+", value.lower()) if len(token) >= 3}
 
 
+def _normalize_retrieval_query(value: str) -> str:
+    collapsed = " ".join(value.split())
+    if not collapsed:
+        return value
+
+    for pattern in RETRIEVAL_PREFIX_PATTERNS:
+        match = pattern.match(collapsed)
+        if not match:
+            continue
+        candidate = " ".join((match.group(1) or "").split()).strip(" \t\r\n?!.,:;\"'")
+        if len(candidate) >= 3:
+            return candidate
+    return collapsed
+
+
 def _count_overlap_tokens(query_tokens: set[str], content_tokens: set[str]) -> int:
     if not query_tokens or not content_tokens:
         return 0
@@ -514,8 +538,9 @@ def run_knowledge_generation(
     retrieval_limit: int,
     allow_fallback: bool = True,
 ) -> tuple[LLMProvider, dict]:
-    query_tokens = _tokenize_text(last_user_msg)
-    recent_email_count = _extract_recent_email_request_count(last_user_msg)
+    retrieval_query = _normalize_retrieval_query(last_user_msg)
+    query_tokens = _tokenize_text(retrieval_query)
+    recent_email_count = _extract_recent_email_request_count(retrieval_query)
     if recent_email_count:
         retrieved = _recent_source_hits(
             db,
@@ -532,8 +557,8 @@ def run_knowledge_generation(
             db,
             tenant_id=tenant_id,
             user_id=user_id,
-            query=last_user_msg,
-            limit=max(retrieval_limit, _extract_requested_item_count(last_user_msg) or retrieval_limit),
+            query=retrieval_query,
+            limit=max(retrieval_limit, _extract_requested_item_count(retrieval_query) or retrieval_limit),
         )
 
     source_intents = _detect_source_intents(query_tokens)
@@ -541,7 +566,7 @@ def run_knowledge_generation(
         intent_hits = [item for item in retrieved if _is_source_intent_match(item, source_intents)]
         if intent_hits:
             retrieved = intent_hits
-    filter_result = _filter_retrieval_hits(last_user_msg, retrieved, source_intents)
+    filter_result = _filter_retrieval_hits(retrieval_query, retrieved, source_intents)
     filtered_hits = filter_result.hits
 
     fallback_used = False
@@ -572,6 +597,9 @@ def run_knowledge_generation(
         user_id=user_id,
         query_hash=hashlib.sha256(last_user_msg.encode("utf-8")).hexdigest()[:12],
         query_length=len(last_user_msg),
+        retrieval_query_hash=hashlib.sha256(retrieval_query.encode("utf-8")).hexdigest()[:12],
+        retrieval_query_length=len(retrieval_query),
+        retrieval_query_modified=retrieval_query != last_user_msg,
         retrieved_count=len(retrieved),
         filtered_count=len(filtered_hits),
         top_score=max((item.score for item in retrieved), default=0.0),
