@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -9,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_tenant_membership, get_db, require_tenant_admin
+from app.core.config import settings
 from app.core.security import decrypt_secret, encrypt_secret
 from app.models.channel_facebook_connector import ChannelFacebookConnector
 from app.models.channel_telegram_connector import ChannelTelegramConnector
@@ -85,11 +87,33 @@ def _read_channel(name: str, row) -> ChannelConnectorRead:
 
 
 def _build_public_api_base(request: Request) -> str:
+    configured = (settings.api_base_url or "").strip()
+    if configured:
+        parsed = urlparse(configured)
+        host = (parsed.hostname or "").lower()
+        is_local = host in {"localhost", "127.0.0.1", "0.0.0.0", "testserver"} or host.endswith(".local")
+        if parsed.scheme == "https":
+            return configured.rstrip("/")
+        if parsed.scheme == "http" and is_local:
+            return configured.rstrip("/")
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return configured.replace("http://", "https://", 1).rstrip("/")
+
     forwarded_proto = request.headers.get("X-Forwarded-Proto")
     forwarded_host = request.headers.get("X-Forwarded-Host")
     if forwarded_proto and forwarded_host:
-        return f"{forwarded_proto}://{forwarded_host}".rstrip("/")
-    return str(request.base_url).rstrip("/")
+        scheme = "https" if forwarded_proto.lower() != "http" else "http"
+        if forwarded_host.lower().startswith(("localhost", "127.0.0.1", "0.0.0.0", "testserver")):
+            return f"{scheme}://{forwarded_host}".rstrip("/")
+        return f"https://{forwarded_host}".rstrip("/")
+
+    fallback = str(request.base_url).rstrip("/")
+    parsed_fallback = urlparse(fallback)
+    host = (parsed_fallback.hostname or "").lower()
+    is_local = host in {"localhost", "127.0.0.1", "0.0.0.0", "testserver"} or host.endswith(".local")
+    if fallback.startswith("http://") and not is_local:
+        return fallback.replace("http://", "https://", 1)
+    return fallback
 
 
 def _telegram_webhook_url(*, connector_id: str, request: Request) -> str:
