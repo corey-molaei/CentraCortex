@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from typing import Any
+
+import httpx
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -22,6 +26,7 @@ from app.schemas.channels import (
 from app.services.channel_dispatcher import resolve_contact, run_channel_message
 
 router = APIRouter(prefix="/channels", tags=["channels"])
+logger = structlog.get_logger(__name__)
 
 
 def _telegram(db: Session, tenant_id: str) -> ChannelTelegramConnector:
@@ -59,8 +64,10 @@ def _facebook(db: Session, tenant_id: str) -> ChannelFacebookConnector:
 
 def _read_channel(name: str, row) -> ChannelConnectorRead:
     configured = False
+    config_json = dict(row.config_json or {})
     if name == "telegram":
         configured = bool(row.bot_token_encrypted)
+        config_json["webhook_path"] = f"/api/v1/channels/telegram/webhook/{row.id}"
     elif name == "whatsapp":
         configured = bool(row.access_token_encrypted and row.phone_number_id)
     elif name == "facebook":
@@ -73,8 +80,129 @@ def _read_channel(name: str, row) -> ChannelConnectorRead:
         enabled=row.enabled,
         configured=configured,
         last_error=row.last_error,
-        config_json=row.config_json or {},
+        config_json=config_json,
     )
+
+
+def _build_public_api_base(request: Request) -> str:
+    forwarded_proto = request.headers.get("X-Forwarded-Proto")
+    forwarded_host = request.headers.get("X-Forwarded-Host")
+    if forwarded_proto and forwarded_host:
+        return f"{forwarded_proto}://{forwarded_host}".rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+def _telegram_webhook_url(*, connector_id: str, request: Request) -> str:
+    return f"{_build_public_api_base(request)}/api/v1/channels/telegram/webhook/{connector_id}"
+
+
+def _register_telegram_webhook(
+    *,
+    bot_token: str,
+    webhook_url: str,
+    webhook_secret: str | None,
+) -> None:
+    payload: dict[str, Any] = {
+        "url": webhook_url,
+        "drop_pending_updates": False,
+        "allowed_updates": ["message", "edited_message"],
+    }
+    secret_value = (webhook_secret or "").strip()
+    if secret_value:
+        payload["secret_token"] = secret_value
+
+    with httpx.Client(timeout=20) as client:
+        response = client.post(
+            f"https://api.telegram.org/bot{bot_token}/setWebhook",
+            json=payload,
+        )
+    if response.status_code >= 400:
+        raise ValueError(f"Telegram setWebhook failed ({response.status_code}): {response.text[:400]}")
+    data = response.json()
+    if not data.get("ok"):
+        raise ValueError(str(data.get("description") or "Telegram setWebhook failed"))
+
+
+def _send_telegram_message(*, bot_token: str, chat_id: str, text: str) -> None:
+    safe_text = (text or "").strip() or "Done."
+    safe_text = safe_text[:3900]
+    payload = {
+        "chat_id": chat_id,
+        "text": safe_text,
+    }
+    with httpx.Client(timeout=20) as client:
+        response = client.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json=payload,
+        )
+    if response.status_code >= 400:
+        raise ValueError(f"Telegram sendMessage failed ({response.status_code}): {response.text[:400]}")
+    data = response.json()
+    if not data.get("ok"):
+        raise ValueError(str(data.get("description") or "Telegram sendMessage failed"))
+
+
+def _parse_telegram_update(update: dict[str, Any]) -> tuple[ChannelInboundEvent | None, str | None]:
+    message = update.get("message") or update.get("edited_message")
+    if not isinstance(message, dict):
+        return None, None
+
+    text = str(message.get("text") or "").strip()
+    if not text:
+        return None, None
+
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    sender = message.get("from") if isinstance(message.get("from"), dict) else {}
+    chat_id_raw = chat.get("id")
+    sender_id_raw = sender.get("id")
+    chat_id = str(chat_id_raw) if chat_id_raw is not None else ""
+    external_user_id = str(sender_id_raw) if sender_id_raw is not None else chat_id
+    if not external_user_id:
+        return None, None
+
+    first_name = str(sender.get("first_name") or "").strip()
+    last_name = str(sender.get("last_name") or "").strip()
+    username = str(sender.get("username") or "").strip()
+    full_name = " ".join(part for part in [first_name, last_name] if part).strip()
+    display_name = full_name or (f"@{username}" if username else None)
+
+    return (
+        ChannelInboundEvent(
+            external_user_id=external_user_id,
+            text=text,
+            name=display_name,
+            phone=None,
+            email=None,
+        ),
+        chat_id or external_user_id,
+    )
+
+
+def _workspace_actor(db: Session, *, tenant_id: str) -> TenantMembership:
+    actor = db.execute(
+        select(TenantMembership)
+        .where(TenantMembership.tenant_id == tenant_id)
+        .order_by(TenantMembership.role.asc(), TenantMembership.created_at.asc())
+    ).scalars().first()
+    if actor is None:
+        raise HTTPException(status_code=400, detail="No workspace member available for channel runtime")
+    return actor
+
+
+def _ensure_workspace_google_default(db: Session, *, tenant_id: str) -> None:
+    integration = db.execute(
+        select(GoogleUserConnector).where(
+            GoogleUserConnector.tenant_id == tenant_id,
+            GoogleUserConnector.is_workspace_default.is_(True),
+            GoogleUserConnector.enabled.is_(True),
+            GoogleUserConnector.access_token_encrypted.is_not(None),
+        )
+    ).scalar_one_or_none()
+    if not integration:
+        raise HTTPException(
+            status_code=400,
+            detail="Workspace default Google account is not connected. Configure /connectors/google first.",
+        )
 
 
 @router.get("/status", response_model=list[ChannelConnectorRead])
@@ -92,6 +220,7 @@ def channel_status(
 @router.put("/telegram", response_model=ChannelConnectorRead)
 def upsert_telegram(
     payload: TelegramConnectorUpdate,
+    request: Request,
     admin: TenantMembership = Depends(require_tenant_admin),
     db: Session = Depends(get_db),
 ) -> ChannelConnectorRead:
@@ -144,14 +273,39 @@ def upsert_facebook(
 
 @router.post("/telegram/test", response_model=ChannelTestResponse)
 def test_telegram(
+    request: Request,
     membership: TenantMembership = Depends(get_current_tenant_membership),
     db: Session = Depends(get_db),
 ) -> ChannelTestResponse:
     row = _telegram(db, membership.tenant_id)
     if not row.bot_token_encrypted:
         return ChannelTestResponse(success=False, message="Telegram bot token is not configured")
-    _ = decrypt_secret(row.bot_token_encrypted)
-    return ChannelTestResponse(success=True, message="Telegram connector looks configured")
+    bot_token = decrypt_secret(row.bot_token_encrypted)
+    webhook_url = _telegram_webhook_url(connector_id=row.id, request=request)
+    try:
+        _register_telegram_webhook(
+            bot_token=bot_token,
+            webhook_url=webhook_url,
+            webhook_secret=row.webhook_secret,
+        )
+    except Exception as exc:  # noqa: BLE001
+        row.last_error = str(exc)[:1800]
+        db.commit()
+        logger.warning(
+            "telegram_webhook_registration_failed",
+            tenant_id=membership.tenant_id,
+            connector_id=row.id,
+            error=str(exc),
+        )
+        return ChannelTestResponse(success=False, message=f"Telegram webhook registration failed: {exc}")
+
+    row.last_error = None
+    row.config_json = {
+        **(row.config_json or {}),
+        "webhook_url": webhook_url,
+    }
+    db.commit()
+    return ChannelTestResponse(success=True, message=f"Telegram connector looks configured. Webhook: {webhook_url}")
 
 
 @router.post("/whatsapp/test", response_model=ChannelTestResponse)
@@ -192,19 +346,7 @@ def telegram_webhook(
     if not row.enabled:
         raise HTTPException(status_code=400, detail="Telegram connector is disabled")
 
-    integration = db.execute(
-        select(GoogleUserConnector).where(
-            GoogleUserConnector.tenant_id == tenant_id,
-            GoogleUserConnector.is_workspace_default.is_(True),
-            GoogleUserConnector.enabled.is_(True),
-            GoogleUserConnector.access_token_encrypted.is_not(None),
-        )
-    ).scalar_one_or_none()
-    if not integration:
-        raise HTTPException(
-            status_code=400,
-            detail="Workspace default Google account is not connected. Configure /connectors/google first.",
-        )
+    _ensure_workspace_google_default(db, tenant_id=tenant_id)
 
     contact = resolve_contact(
         db,
@@ -216,13 +358,7 @@ def telegram_webhook(
         email=payload.email,
     )
     # use deterministic workspace admin actor; first owner/admin member
-    actor = db.execute(
-        select(TenantMembership)
-        .where(TenantMembership.tenant_id == tenant_id)
-        .order_by(TenantMembership.role.asc(), TenantMembership.created_at.asc())
-    ).scalars().first()
-    if actor is None:
-        raise HTTPException(status_code=400, detail="No workspace member available for channel runtime")
+    actor = _workspace_actor(db, tenant_id=tenant_id)
 
     return run_channel_message(
         db,
@@ -232,6 +368,92 @@ def telegram_webhook(
         contact=contact,
         message=payload.text,
     )
+
+
+@router.post("/telegram/webhook/{connector_id}")
+async def telegram_webhook_public(
+    connector_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    row = db.execute(select(ChannelTelegramConnector).where(ChannelTelegramConnector.id == connector_id)).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Telegram connector not found")
+    if not row.enabled:
+        raise HTTPException(status_code=400, detail="Telegram connector is disabled")
+    if not row.bot_token_encrypted:
+        raise HTTPException(status_code=400, detail="Telegram bot token is not configured")
+
+    expected_secret = (row.webhook_secret or "").strip()
+    if expected_secret:
+        provided_secret = (request.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
+        if provided_secret != expected_secret:
+            logger.warning(
+                "telegram_webhook_secret_mismatch",
+                tenant_id=row.tenant_id,
+                connector_id=row.id,
+            )
+            raise HTTPException(status_code=403, detail="Invalid Telegram webhook secret")
+
+    try:
+        update = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Invalid Telegram payload: {exc}") from exc
+
+    if not isinstance(update, dict):
+        raise HTTPException(status_code=400, detail="Invalid Telegram payload")
+
+    inbound, chat_id = _parse_telegram_update(update)
+    if inbound is None or not chat_id:
+        logger.debug(
+            "telegram_webhook_ignored_non_text",
+            tenant_id=row.tenant_id,
+            connector_id=row.id,
+        )
+        return {"ok": True, "ignored": True}
+
+    tenant_id = row.tenant_id
+    _ensure_workspace_google_default(db, tenant_id=tenant_id)
+    actor = _workspace_actor(db, tenant_id=tenant_id)
+    contact = resolve_contact(
+        db,
+        tenant_id=tenant_id,
+        channel="telegram",
+        external_user_id=inbound.external_user_id,
+        name=inbound.name,
+        phone=inbound.phone,
+        email=inbound.email,
+    )
+    result = run_channel_message(
+        db,
+        tenant_id=tenant_id,
+        user_id=actor.user_id,
+        channel="telegram",
+        contact=contact,
+        message=inbound.text,
+    )
+
+    bot_token = decrypt_secret(row.bot_token_encrypted)
+    try:
+        _send_telegram_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text=str(result.get("answer") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        row.last_error = str(exc)[:1800]
+        db.commit()
+        logger.exception(
+            "telegram_send_failed",
+            tenant_id=tenant_id,
+            connector_id=row.id,
+            chat_id=chat_id,
+        )
+        raise HTTPException(status_code=502, detail=f"Telegram send failed: {exc}") from exc
+
+    row.last_error = None
+    db.commit()
+    return {"ok": True, "conversation_id": result.get("conversation_id")}
 
 
 @router.post("/whatsapp/webhook")

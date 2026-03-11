@@ -89,6 +89,15 @@ export function ChannelsPage() {
                 {byChannel.telegram?.configured ? "Configured" : "Not configured"} | {byChannel.telegram?.enabled ? "Enabled" : "Disabled"}
               </span>
             </div>
+            {byChannel.telegram?.id && (
+              <div className="mb-2 rounded border border-slate-700 bg-slate-900/70 p-2 text-xs text-slate-300">
+                <div>Webhook URL</div>
+                <div className="break-all text-slate-200">
+                  {`${window.location.origin}/api/v1/channels/telegram/webhook/${byChannel.telegram.id}`}
+                </div>
+                <div className="mt-1 text-slate-400">Click Test after saving to register this webhook with Telegram.</div>
+              </div>
+            )}
             <div className="grid gap-2 md:grid-cols-2">
               <input
                 className="rounded border border-slate-700 bg-slate-900 p-2"
