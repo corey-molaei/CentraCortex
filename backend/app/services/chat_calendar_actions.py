@@ -980,6 +980,7 @@ def _get_active_pending_action(
             ChatPendingAction.tenant_id == tenant_id,
             ChatPendingAction.user_id == user_id,
             ChatPendingAction.conversation_id == conversation_id,
+            ChatPendingAction.action_type.in_([CREATE_ACTION, UPDATE_ACTION, DELETE_ACTION]),
             ChatPendingAction.status.in_([PENDING_DISAMBIGUATION, PENDING_CONFIRMATION]),
         )
         .order_by(ChatPendingAction.created_at.desc())

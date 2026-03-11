@@ -53,7 +53,15 @@ def _seed_provider(
     return provider
 
 
-def _seed_google_account(db_session, *, tenant_id: str, user_id: str, email: str) -> GoogleUserConnector:
+def _seed_google_account(
+    db_session,
+    *,
+    tenant_id: str,
+    user_id: str,
+    email: str,
+    contacts_enabled: bool = False,
+    scopes: list[str] | None = None,
+) -> GoogleUserConnector:
     account = GoogleUserConnector(
         tenant_id=tenant_id,
         user_id=user_id,
@@ -63,11 +71,12 @@ def _seed_google_account(db_session, *, tenant_id: str, user_id: str, email: str
         access_token_encrypted=encrypt_secret("token"),
         refresh_token_encrypted=encrypt_secret("refresh"),
         token_expires_at=datetime.now(UTC) + timedelta(hours=2),
-        scopes=[],
+        scopes=scopes or [],
         gmail_enabled=True,
         gmail_labels=["INBOX"],
         calendar_enabled=False,
         calendar_ids=["primary"],
+        contacts_enabled=contacts_enabled,
         enabled=True,
         is_primary=True,
     )
@@ -431,6 +440,127 @@ def test_chat_v2_email_intent_uses_override_provider_without_fallback(client, db
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 200
+    assert captured["provider_id_override"] == override_provider.id
+    assert captured["allow_fallback"] is False
+
+
+def test_chat_v2_contacts_prompt_routes_to_contacts_action_engine(client, db_session, monkeypatch):
+    token = _seed_and_login(client, db_session)
+    membership = db_session.query(TenantMembership).first()
+    assert membership is not None
+    user = db_session.query(User).filter(User.id == membership.user_id).one()
+    _seed_google_account(
+        db_session,
+        tenant_id=membership.tenant_id,
+        user_id=membership.user_id,
+        email=user.email,
+        contacts_enabled=True,
+        scopes=[
+            "https://www.googleapis.com/auth/contacts.readonly",
+            "https://www.googleapis.com/auth/contacts",
+        ],
+    )
+
+    monkeypatch.setattr("app.core.config.settings.google_client_id", "google-client-id")
+    monkeypatch.setattr("app.core.config.settings.google_client_secret", "google-client-secret")
+    monkeypatch.setattr("app.services.chat_contacts_actions.list_contacts", lambda *args, **kwargs: [])
+
+    response = client.post(
+        "/api/v2/chat/complete",
+        json={"messages": [{"role": "user", "content": "list my contacts"}]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["interaction_type"] == "execution_result"
+    assert payload["provider_name"] == "Contacts Action Engine"
+
+
+def test_chat_v2_contacts_mutation_returns_confirmation_required(client, db_session, monkeypatch):
+    token = _seed_and_login(client, db_session)
+    membership = db_session.query(TenantMembership).first()
+    assert membership is not None
+    user = db_session.query(User).filter(User.id == membership.user_id).one()
+    monkeypatch.setattr("app.core.config.settings.google_client_id", "google-client-id")
+    monkeypatch.setattr("app.core.config.settings.google_client_secret", "google-client-secret")
+    _seed_google_account(
+        db_session,
+        tenant_id=membership.tenant_id,
+        user_id=membership.user_id,
+        email=user.email,
+        contacts_enabled=True,
+        scopes=[
+            "https://www.googleapis.com/auth/contacts.readonly",
+            "https://www.googleapis.com/auth/contacts",
+        ],
+    )
+
+    response = client.post(
+        "/api/v2/chat/complete",
+        json={"messages": [{"role": "user", "content": "add contact John Doe email john@example.com"}]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["interaction_type"] == "confirmation_required"
+    assert payload["provider_name"] == "Contacts Action Engine"
+    assert "Please confirm creating this contact" in payload["answer"]
+
+
+def test_chat_v2_contacts_intent_uses_override_provider_without_fallback(client, db_session, monkeypatch):
+    token = _seed_and_login(client, db_session)
+    membership = db_session.query(TenantMembership).first()
+    assert membership is not None
+    user = db_session.query(User).filter(User.id == membership.user_id).one()
+    override_provider = _seed_provider(
+        db_session,
+        tenant_id=membership.tenant_id,
+        name="Contacts Override",
+        model_name="gemma3:4b",
+        is_default=True,
+    )
+    _seed_google_account(
+        db_session,
+        tenant_id=membership.tenant_id,
+        user_id=membership.user_id,
+        email=user.email,
+        contacts_enabled=True,
+        scopes=[
+            "https://www.googleapis.com/auth/contacts.readonly",
+            "https://www.googleapis.com/auth/contacts",
+        ],
+    )
+
+    monkeypatch.setattr("app.core.config.settings.google_client_id", "google-client-id")
+    monkeypatch.setattr("app.core.config.settings.google_client_secret", "google-client-secret")
+    captured: dict = {}
+
+    def fake_chat(self, **kwargs):  # noqa: ARG001
+        captured.update(kwargs)
+        return (
+            override_provider,
+            {
+                "answer": '{"intent":"contacts_list","target_query":"john","confidence":0.9}',
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+                "cost_usd": 0.0,
+            },
+        )
+
+    monkeypatch.setattr("app.services.chat_contacts_actions.LLMRouter.chat", fake_chat)
+    monkeypatch.setattr("app.services.chat_contacts_actions.search_contacts", lambda *args, **kwargs: [])
+
+    response = client.post(
+        "/api/v2/chat/complete",
+        json={
+            "messages": [{"role": "user", "content": "find contact john"}],
+            "provider_id_override": override_provider.id,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    assert response.json()["provider_name"] == "Contacts Action Engine"
     assert captured["provider_id_override"] == override_provider.id
     assert captured["allow_fallback"] is False
 

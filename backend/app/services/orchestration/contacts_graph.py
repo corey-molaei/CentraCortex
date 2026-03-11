@@ -4,15 +4,15 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.models.chat_pending_action import ChatPendingAction
-from app.services.chat_calendar_actions import (
-    CREATE_ACTION,
-    DELETE_ACTION,
-    UPDATE_ACTION,
-    maybe_handle_calendar_chat_action,
+from app.services.chat_contacts_actions import (
+    INTENT_CREATE,
+    INTENT_DELETE,
+    INTENT_UPDATE,
+    maybe_handle_contacts_chat_action,
 )
 
 
-def _latest_pending_calendar_action(
+def _latest_pending_contacts_action(
     db: Session,
     *,
     tenant_id: str,
@@ -25,32 +25,28 @@ def _latest_pending_calendar_action(
             ChatPendingAction.tenant_id == tenant_id,
             ChatPendingAction.user_id == user_id,
             ChatPendingAction.conversation_id == conversation_id,
-            ChatPendingAction.action_type.in_([CREATE_ACTION, UPDATE_ACTION, DELETE_ACTION]),
+            ChatPendingAction.action_type.in_([INTENT_CREATE, INTENT_UPDATE, INTENT_DELETE]),
             ChatPendingAction.status.in_(["pending_disambiguation", "pending_confirmation"]),
         )
         .order_by(desc(ChatPendingAction.updated_at), desc(ChatPendingAction.created_at))
     ).scalar_one_or_none()
 
 
-def run_calendar_subgraph(
+def run_contacts_subgraph(
     db: Session,
     *,
     tenant_id: str,
     user_id: str,
     conversation_id: str,
     message: str,
-    client_timezone: str | None,
-    client_now_iso: str | None,
     provider_id_override: str | None,
 ) -> dict:
-    action = maybe_handle_calendar_chat_action(
+    action = maybe_handle_contacts_chat_action(
         db,
         tenant_id=tenant_id,
         user_id=user_id,
         conversation_id=conversation_id,
         message=message,
-        client_timezone=client_timezone,
-        client_now_iso=client_now_iso,
         provider_id_override=provider_id_override,
     )
     if not action or not action.handled:
@@ -59,20 +55,20 @@ def run_calendar_subgraph(
     response: dict = {
         "intent_handled": True,
         "answer": action.answer,
-        "provider_id": "calendar-action",
-        "provider_name": "Calendar Action Engine",
-        "model_name": "calendar-action",
+        "provider_id": "contacts-action",
+        "provider_name": "Contacts Action Engine",
+        "model_name": "contacts-action",
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
         "cost_usd": 0.0,
         "citations": [],
         "interaction_type": "execution_result",
-        "action_context": {"action_type": "calendar"},
+        "action_context": {"action_type": "contacts"},
         "options": [],
     }
 
-    pending = _latest_pending_calendar_action(
+    pending = _latest_pending_contacts_action(
         db,
         tenant_id=tenant_id,
         user_id=user_id,
@@ -102,10 +98,10 @@ def run_calendar_subgraph(
         response["interaction_type"] = "selection_required"
         options: list[dict[str, str]] = []
         for idx, candidate in enumerate(pending.candidates_json or [], start=1):
-            label = str(candidate.get("summary") or "Untitled")
-            start_dt = candidate.get("start_datetime")
-            if start_dt:
-                label = f"{label} ({start_dt})"
+            label = str(candidate.get("display_name") or "Unnamed")
+            email = str(candidate.get("primary_email") or "").strip()
+            if email:
+                label = f"{label} ({email})"
             options.append({"id": str(idx), "label": label})
         response["options"] = options
 

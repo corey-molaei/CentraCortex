@@ -18,6 +18,7 @@ from app.services.chat_runtime import (
 )
 from app.services.orchestration.agent_graph import run_agent_subgraph
 from app.services.orchestration.calendar_graph import run_calendar_subgraph
+from app.services.orchestration.contacts_graph import run_contacts_subgraph
 from app.services.orchestration.email_graph import run_email_subgraph
 from app.services.orchestration.state import GraphState
 
@@ -52,6 +53,9 @@ EMAIL_TOKENS = {
     "smtp",
 }
 AGENT_TOKENS = {"agent", "tool", "approval", "workflow"}
+CONTACTS_TOKENS = {"contact", "contacts", "person", "people", "addressbook"}
+CALENDAR_PENDING_ACTION_TYPES = {"calendar_create", "calendar_update", "calendar_delete"}
+CONTACTS_PENDING_ACTION_TYPES = {"contacts_create", "contacts_update", "contacts_delete"}
 
 
 def _checkpoint(state: GraphState, node_name: str, status: str = "ok", error_message: str | None = None) -> None:
@@ -173,6 +177,19 @@ def _resume_pending_action_node(state: GraphState) -> GraphState:
             ChatPendingAction.tenant_id == state["tenant_id"],
             ChatPendingAction.user_id == state["user_id"],
             ChatPendingAction.conversation_id == state["conversation_id"],
+            ChatPendingAction.action_type.in_(CALENDAR_PENDING_ACTION_TYPES),
+            ChatPendingAction.status.in_(["pending_disambiguation", "pending_confirmation"]),
+        )
+        .order_by(desc(ChatPendingAction.updated_at), desc(ChatPendingAction.created_at))
+    ).scalar_one_or_none()
+
+    pending_contacts = db.execute(
+        select(ChatPendingAction)
+        .where(
+            ChatPendingAction.tenant_id == state["tenant_id"],
+            ChatPendingAction.user_id == state["user_id"],
+            ChatPendingAction.conversation_id == state["conversation_id"],
+            ChatPendingAction.action_type.in_(CONTACTS_PENDING_ACTION_TYPES),
             ChatPendingAction.status.in_(["pending_disambiguation", "pending_confirmation"]),
         )
         .order_by(desc(ChatPendingAction.updated_at), desc(ChatPendingAction.created_at))
@@ -193,6 +210,10 @@ def _resume_pending_action_node(state: GraphState) -> GraphState:
         state["intent"] = "calendar"
         state["pending_action_id"] = pending_calendar.id
         state["pending_action_status"] = pending_calendar.status
+    elif pending_contacts:
+        state["intent"] = "contacts"
+        state["pending_action_id"] = pending_contacts.id
+        state["pending_action_status"] = pending_contacts.status
     elif pending_email:
         state["intent"] = "email"
         state["pending_action_id"] = pending_email.id
@@ -216,6 +237,8 @@ def _intent_router_node(state: GraphState) -> GraphState:
 
     if tokens.intersection(CALENDAR_TOKENS):
         state["intent"] = "calendar"
+    elif tokens.intersection(CONTACTS_TOKENS):
+        state["intent"] = "contacts"
     elif tokens.intersection(EMAIL_TOKENS):
         state["intent"] = "email"
     elif tokens.intersection(AGENT_TOKENS):
@@ -245,6 +268,15 @@ def _dispatch_node(state: GraphState) -> GraphState:
             message=state["latest_user_message"],
             client_timezone=state.get("client_timezone"),
             client_now_iso=state.get("client_now_iso"),
+            provider_id_override=state.get("effective_provider_id"),
+        )
+    elif intent == "contacts":
+        result = run_contacts_subgraph(
+            db,
+            tenant_id=state["tenant_id"],
+            user_id=state["user_id"],
+            conversation_id=state["conversation_id"],
+            message=state["latest_user_message"],
             provider_id_override=state.get("effective_provider_id"),
         )
     elif intent == "email":

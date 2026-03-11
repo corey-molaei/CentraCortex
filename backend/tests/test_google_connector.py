@@ -338,6 +338,7 @@ def test_google_oauth_start_includes_contacts_scope_when_enabled(client, db_sess
     assert "https://www.googleapis.com/auth/drive.readonly" in scopes
     assert "https://www.googleapis.com/auth/spreadsheets" in scopes
     assert "https://www.googleapis.com/auth/contacts.readonly" in scopes
+    assert "https://www.googleapis.com/auth/contacts" in scopes
 
 
 def test_google_oauth_callback_merges_duplicate_sub_accounts(client, db_session, monkeypatch):

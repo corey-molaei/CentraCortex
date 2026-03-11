@@ -20,6 +20,7 @@ from app.models.llm_provider import LLMProvider
 from app.schemas.llm import Citation, ConversationDetail, ConversationMessageRead, ConversationSummary
 from app.services.acl import get_accessible_documents
 from app.services.chat_calendar_actions import maybe_handle_calendar_chat_action
+from app.services.chat_contacts_actions import maybe_handle_contacts_chat_action
 from app.services.chat_email_actions import maybe_handle_email_chat_action
 from app.services.document_indexing import ChunkSearchResult, hybrid_search_chunks
 from app.services.llm_router import LLMRouter
@@ -47,9 +48,11 @@ logger = structlog.get_logger(__name__)
 
 EMAIL_INTENT_TOKENS = {"email", "emails", "gmail", "inbox", "sent", "mail", "mails"}
 CALENDAR_INTENT_TOKENS = {"calendar", "calendars", "event", "events", "meeting", "meetings", "schedule"}
+CONTACTS_INTENT_TOKENS = {"contact", "contacts", "person", "people", "addressbook"}
 
 EMAIL_SOURCE_TYPES = {"google_gmail", "imap_email"}
 CALENDAR_SOURCE_TYPES = {"google_calendar"}
+CONTACTS_SOURCE_TYPES = {"google_contacts"}
 
 
 @dataclass
@@ -386,6 +389,8 @@ def _detect_source_intents(query_tokens: set[str]) -> set[str]:
         intents.add("email")
     if query_tokens.intersection(CALENDAR_INTENT_TOKENS):
         intents.add("calendar")
+    if query_tokens.intersection(CONTACTS_INTENT_TOKENS):
+        intents.add("contacts")
     return intents
 
 
@@ -398,6 +403,8 @@ def _is_source_intent_match(item: ChunkSearchResult, intents: set[str]) -> bool:
     if "email" in intents and source_type in EMAIL_SOURCE_TYPES:
         return True
     if "calendar" in intents and source_type in CALENDAR_SOURCE_TYPES:
+        return True
+    if "contacts" in intents and source_type in CONTACTS_SOURCE_TYPES:
         return True
     return False
 
@@ -695,6 +702,42 @@ def run_chat(
         )
         return conversation, assistant_msg, action_provider, {
             "answer": calendar_action.answer,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "citations": [],
+            "blocked": False,
+            "safety_flags": safety.flags,
+        }
+
+    contacts_action = maybe_handle_contacts_chat_action(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation.id,
+        message=last_user_msg,
+        provider_id_override=effective_provider_id,
+    )
+    if contacts_action and contacts_action.handled:
+        assistant_msg = _save_message(
+            db,
+            tenant_id=tenant_id,
+            conversation=conversation,
+            user_id=None,
+            role="assistant",
+            content=contacts_action.answer,
+            citations=[],
+            safety_flags=safety.flags,
+            llm_model_name="contacts-action",
+        )
+        action_provider = SimpleNamespace(
+            id="contacts-action",
+            name="Contacts Action Engine",
+            model_name="contacts-action",
+        )
+        return conversation, assistant_msg, action_provider, {
+            "answer": contacts_action.answer,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,

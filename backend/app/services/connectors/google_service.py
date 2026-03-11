@@ -80,7 +80,12 @@ def _oauth_scopes_for_connector(connector: GoogleUserConnector) -> list[str]:
     if connector.sheets_enabled:
         scopes.append("https://www.googleapis.com/auth/spreadsheets")
     if connector.contacts_enabled:
-        scopes.append("https://www.googleapis.com/auth/contacts.readonly")
+        scopes.extend(
+            [
+                "https://www.googleapis.com/auth/contacts.readonly",
+                "https://www.googleapis.com/auth/contacts",
+            ]
+        )
     return list(dict.fromkeys(scopes))
 
 
@@ -1462,6 +1467,294 @@ def list_contact_groups(
             }
         )
     return rows
+
+
+def _person_fields_mask() -> str:
+    return "names,emailAddresses,phoneNumbers,organizations,biographies,metadata"
+
+
+def _person_to_contact_record(person: dict) -> dict:
+    names = person.get("names") or []
+    emails = person.get("emailAddresses") or []
+    phones = person.get("phoneNumbers") or []
+    orgs = person.get("organizations") or []
+    biographies = person.get("biographies") or []
+
+    primary_name = names[0] if names else {}
+    display_name = str(primary_name.get("displayName") or "")
+    given_name = str(primary_name.get("givenName") or "")
+    family_name = str(primary_name.get("familyName") or "")
+
+    email_values = [str((entry or {}).get("value") or "").strip() for entry in emails]
+    email_values = [value for value in email_values if value]
+
+    phone_values = [str((entry or {}).get("value") or "").strip() for entry in phones]
+    phone_values = [value for value in phone_values if value]
+
+    org_values = [str((entry or {}).get("name") or "").strip() for entry in orgs]
+    org_values = [value for value in org_values if value]
+
+    biography = ""
+    for entry in biographies:
+        biography = str((entry or {}).get("value") or "").strip()
+        if biography:
+            break
+
+    etag = str(person.get("etag") or "").strip()
+    if not etag:
+        for source in ((person.get("metadata") or {}).get("sources") or []):
+            value = str((source or {}).get("etag") or "").strip()
+            if value:
+                etag = value
+                break
+
+    return {
+        "resource_name": str(person.get("resourceName") or ""),
+        "display_name": display_name,
+        "given_name": given_name,
+        "family_name": family_name,
+        "emails": email_values,
+        "phones": phone_values,
+        "organizations": org_values,
+        "biography": biography,
+        "primary_email": email_values[0] if email_values else None,
+        "primary_phone": phone_values[0] if phone_values else None,
+        "etag": etag or None,
+    }
+
+
+def list_contacts(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    query: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
+    access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
+    rows: list[dict] = []
+    cap = max(1, min(limit, 200))
+    person_fields = _person_fields_mask()
+
+    if query:
+        payload = _google_request(
+            method="GET",
+            access_token=access_token,
+            url=f"{GOOGLE_PEOPLE_BASE_URL}/people:searchContacts",
+            params={
+                "query": query,
+                "readMask": person_fields,
+                "pageSize": cap,
+            },
+        )
+        for item in payload.get("results", []):
+            person = item.get("person") or {}
+            record = _person_to_contact_record(person)
+            if record["resource_name"]:
+                rows.append(record)
+        return rows
+
+    next_token: str | None = None
+    while len(rows) < cap:
+        payload = _google_request(
+            method="GET",
+            access_token=access_token,
+            url=f"{GOOGLE_PEOPLE_BASE_URL}/people/me/connections",
+            params={
+                "personFields": person_fields,
+                "pageSize": min(1000, cap),
+                **({"pageToken": next_token} if next_token else {}),
+            },
+        )
+        for person in payload.get("connections", []):
+            record = _person_to_contact_record(person)
+            if record["resource_name"]:
+                rows.append(record)
+                if len(rows) >= cap:
+                    break
+
+        next_token = payload.get("nextPageToken")
+        if not next_token:
+            break
+
+    return rows
+
+
+def search_contacts(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    query: str,
+    limit: int = 20,
+) -> list[dict]:
+    text = str(query or "").strip()
+    if not text:
+        return []
+    return list_contacts(
+        db,
+        connector,
+        client_id=client_id,
+        client_secret=client_secret,
+        query=text,
+        limit=limit,
+    )
+
+
+def get_contact(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    resource_name: str,
+) -> dict:
+    access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
+    resource = str(resource_name or "").strip()
+    if not resource:
+        raise ValueError("resource_name is required")
+
+    payload = _google_request(
+        method="GET",
+        access_token=access_token,
+        url=f"{GOOGLE_PEOPLE_BASE_URL}/{quote(resource, safe='/')}",
+        params={"personFields": _person_fields_mask()},
+    )
+    record = _person_to_contact_record(payload)
+    if not record["resource_name"]:
+        raise ValueError("Contact not found")
+    return record
+
+
+def _build_contact_person_payload(payload: dict) -> tuple[dict, list[str]]:
+    display_name = str(payload.get("display_name") or "").strip()
+    given_name = str(payload.get("given_name") or "").strip()
+    family_name = str(payload.get("family_name") or "").strip()
+    emails = [str(item).strip() for item in (payload.get("emails") or []) if str(item).strip()]
+    phones = [str(item).strip() for item in (payload.get("phones") or []) if str(item).strip()]
+    organizations = [str(item).strip() for item in (payload.get("organizations") or []) if str(item).strip()]
+    biography = str(payload.get("biography") or "").strip()
+
+    person: dict = {}
+    update_fields: list[str] = []
+
+    if display_name or given_name or family_name:
+        name_payload: dict[str, str] = {}
+        if display_name:
+            name_payload["displayName"] = display_name
+        if given_name:
+            name_payload["givenName"] = given_name
+        if family_name:
+            name_payload["familyName"] = family_name
+        person["names"] = [name_payload]
+        update_fields.append("names")
+
+    if emails:
+        person["emailAddresses"] = [{"value": value} for value in emails]
+        update_fields.append("emailAddresses")
+    if phones:
+        person["phoneNumbers"] = [{"value": value} for value in phones]
+        update_fields.append("phoneNumbers")
+    if organizations:
+        person["organizations"] = [{"name": value} for value in organizations]
+        update_fields.append("organizations")
+    if biography:
+        person["biographies"] = [{"value": biography}]
+        update_fields.append("biographies")
+
+    return person, update_fields
+
+
+def create_contact(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    payload: dict,
+) -> dict:
+    access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
+    person, update_fields = _build_contact_person_payload(payload)
+    if not update_fields:
+        raise ValueError("At least one contact field is required")
+
+    result = _google_request(
+        method="POST",
+        access_token=access_token,
+        url=f"{GOOGLE_PEOPLE_BASE_URL}/people:createContact",
+        json_body=person,
+    )
+    return _person_to_contact_record(result)
+
+
+def update_contact(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    resource_name: str,
+    payload: dict,
+) -> dict:
+    access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
+    resource = str(resource_name or "").strip()
+    if not resource:
+        raise ValueError("resource_name is required")
+
+    current = _google_request(
+        method="GET",
+        access_token=access_token,
+        url=f"{GOOGLE_PEOPLE_BASE_URL}/{quote(resource, safe='/')}",
+        params={"personFields": _person_fields_mask()},
+    )
+    person, update_fields = _build_contact_person_payload(payload)
+    if not update_fields:
+        raise ValueError("No update fields were provided")
+
+    etag = str(current.get("etag") or "").strip()
+    if not etag:
+        for source in ((current.get("metadata") or {}).get("sources") or []):
+            value = str((source or {}).get("etag") or "").strip()
+            if value:
+                etag = value
+                break
+    if not etag:
+        raise ValueError("Contact is missing etag; reconnect and try again")
+
+    person["etag"] = etag
+    person["resourceName"] = resource
+
+    result = _google_request(
+        method="PATCH",
+        access_token=access_token,
+        url=f"{GOOGLE_PEOPLE_BASE_URL}/{quote(resource, safe='/')}:updateContact",
+        params={"updatePersonFields": ",".join(update_fields)},
+        json_body=person,
+    )
+    return _person_to_contact_record(result)
+
+
+def delete_contact(
+    db: Session,
+    connector: GoogleUserConnector,
+    *,
+    client_id: str,
+    client_secret: str,
+    resource_name: str,
+) -> dict:
+    access_token = get_valid_access_token(db, connector, client_id=client_id, client_secret=client_secret)
+    resource = str(resource_name or "").strip()
+    if not resource:
+        raise ValueError("resource_name is required")
+
+    _google_request(
+        method="DELETE",
+        access_token=access_token,
+        url=f"{GOOGLE_PEOPLE_BASE_URL}/{quote(resource, safe='/')}:deleteContact",
+    )
+    return {"resource_name": resource, "deleted": True}
 
 
 def _calendar_event_payload(payload: dict) -> dict:
