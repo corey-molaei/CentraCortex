@@ -154,8 +154,17 @@ export function selectChatAction(payload: {
   });
 }
 
-export function listConversations() {
-  return request<ConversationSummary[]>("/api/v1/chat/conversations");
+export function listConversations(params?: { limit?: number; offset?: number }) {
+  const search = new URLSearchParams();
+  if (typeof params?.limit === "number") {
+    search.set("limit", String(params.limit));
+  }
+  if (typeof params?.offset === "number") {
+    search.set("offset", String(params.offset));
+  }
+  const query = search.toString();
+  const path = query ? `/api/v1/chat/conversations?${query}` : "/api/v1/chat/conversations";
+  return request<ConversationSummary[]>(path);
 }
 
 export function getConversation(conversationId: string) {

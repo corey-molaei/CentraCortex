@@ -84,6 +84,49 @@ const detailB = {
   ]
 };
 
+function buildConversation(index: number) {
+  const iso = new Date(Date.UTC(2026, 1, 20, 12, index, 0)).toISOString();
+  return {
+    id: `conv-${index}`,
+    title: `Conversation ${index}`,
+    created_at: iso,
+    updated_at: iso,
+    last_message_at: iso
+  };
+}
+
+function buildConversationDetail(conversationId: string, content: string) {
+  return {
+    id: conversationId,
+    title: conversationId,
+    created_at: "2026-02-20T10:00:00Z",
+    updated_at: "2026-02-20T10:00:00Z",
+    last_message_at: "2026-02-20T10:00:00Z",
+    messages: [
+      {
+        id: `${conversationId}-user`,
+        role: "user",
+        content,
+        created_at: "2026-02-20T10:00:00Z",
+        citations: [],
+        safety_flags: [],
+        provider_name: null,
+        model_name: null
+      },
+      {
+        id: `${conversationId}-assistant`,
+        role: "assistant",
+        content: `Assistant ${content}`,
+        created_at: "2026-02-20T10:00:10Z",
+        citations: [],
+        safety_flags: [],
+        provider_name: "Test Provider",
+        model_name: "test-model"
+      }
+    ]
+  };
+}
+
 describe("ChatPage", () => {
   afterEach(() => {
     cleanup();
@@ -470,6 +513,82 @@ describe("ChatPage", () => {
       expect(screen.getByText("No citations for current response.")).toBeInTheDocument();
     });
     expect(screen.queryByText(citationSnippet)).not.toBeInTheDocument();
+  });
+
+  it("loads conversations in pages of 8 and appends with Show more", async () => {
+    const allConversations = Array.from({ length: 20 }, (_, index) => buildConversation(index));
+    llmApi.listConversations.mockImplementation(async (params?: { limit?: number; offset?: number }) => {
+      const limit = params?.limit ?? 50;
+      const offset = params?.offset ?? 0;
+      return allConversations.slice(offset, offset + limit);
+    });
+    llmApi.getConversation.mockImplementation(async (conversationId: string) => {
+      return buildConversationDetail(conversationId, conversationId);
+    });
+
+    render(
+      <MemoryRouter>
+        <ChatPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(llmApi.listConversations).toHaveBeenCalledWith({ limit: 8, offset: 0 });
+    });
+    await waitFor(() => {
+      expect(screen.getAllByTestId(/conversation-select-/)).toHaveLength(8);
+    });
+    expect(screen.getByTestId("conversations-show-more")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("conversations-show-more"));
+    await waitFor(() => {
+      expect(llmApi.listConversations).toHaveBeenCalledWith({ limit: 8, offset: 8 });
+    });
+    await waitFor(() => {
+      expect(screen.getAllByTestId(/conversation-select-/)).toHaveLength(16);
+    });
+
+    fireEvent.click(screen.getByTestId("conversations-show-more"));
+    await waitFor(() => {
+      expect(llmApi.listConversations).toHaveBeenCalledWith({ limit: 8, offset: 16 });
+    });
+    await waitFor(() => {
+      expect(screen.getAllByTestId(/conversation-select-/)).toHaveLength(20);
+    });
+    expect(screen.queryByTestId("conversations-show-more")).not.toBeInTheDocument();
+  });
+
+  it("toggles the conversations drawer control and keeps selection working", async () => {
+    llmApi.listConversations.mockResolvedValue([conversationA, conversationB]);
+    llmApi.getConversation
+      .mockResolvedValueOnce(detailA)
+      .mockResolvedValueOnce(detailB);
+
+    render(
+      <MemoryRouter>
+        <ChatPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(llmApi.getConversation).toHaveBeenCalledWith("conv-a");
+    });
+    expect(screen.getByLabelText("Close conversations drawer")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Conversations" }));
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Close conversations drawer")).not.toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("Close conversations drawer")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTestId("conversation-select-conv-b"));
+    await waitFor(() => {
+      expect(llmApi.getConversation).toHaveBeenCalledWith("conv-b");
+    });
   });
 
   it("shows error message when delete request fails", async () => {

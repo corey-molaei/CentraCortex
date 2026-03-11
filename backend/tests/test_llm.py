@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from sqlalchemy import select
@@ -892,6 +893,56 @@ def test_chat_history_citations_and_report(client, db_session, monkeypatch):
     )
     assert report.status_code == 200
     assert report.json()["status"] == "recorded"
+
+
+def test_list_conversations_supports_limit_offset(client, db_session):
+    tenant, admin = seed_tenant_with_admin(db_session)
+    token = login(client)
+    base_time = datetime.now(timezone.utc)
+
+    inserted: list[ChatConversation] = []
+    for idx in range(12):
+        convo = ChatConversation(
+            tenant_id=tenant.id,
+            user_id=admin.id,
+            title=f"Conversation {idx}",
+            last_message_at=base_time + timedelta(minutes=idx),
+        )
+        inserted.append(convo)
+    db_session.add_all(inserted)
+    db_session.commit()
+
+    expected_ids = [row.id for row in sorted(inserted, key=lambda row: row.last_message_at, reverse=True)][3:8]
+    listed = client.get("/api/v1/chat/conversations?limit=5&offset=3", headers={"Authorization": f"Bearer {token}"})
+    assert listed.status_code == 200
+    payload = listed.json()
+    assert len(payload) == 5
+    assert [item["id"] for item in payload] == expected_ids
+
+
+def test_list_conversations_limit_clamp_and_offset_validation(client, db_session):
+    tenant, admin = seed_tenant_with_admin(db_session)
+    token = login(client)
+    base_time = datetime.now(timezone.utc)
+    db_session.add_all(
+        [
+            ChatConversation(
+                tenant_id=tenant.id,
+                user_id=admin.id,
+                title=f"Conversation {idx}",
+                last_message_at=base_time + timedelta(minutes=idx),
+            )
+            for idx in range(120)
+        ]
+    )
+    db_session.commit()
+
+    listed = client.get("/api/v1/chat/conversations?limit=500", headers={"Authorization": f"Bearer {token}"})
+    assert listed.status_code == 200
+    assert len(listed.json()) == 100
+
+    invalid_offset = client.get("/api/v1/chat/conversations?offset=-1", headers={"Authorization": f"Bearer {token}"})
+    assert invalid_offset.status_code == 422
 
 
 def _make_retrieval_hit(*, chunk_id: str, content: str, score: float, source_type: str = "manual"):

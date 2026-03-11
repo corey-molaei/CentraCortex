@@ -13,6 +13,7 @@ import {
 import type { ChatActionOption, Citation, ConversationMessage, ConversationSummary, LLMProvider } from "../types/llm";
 
 const CHAT_PROVIDER_OVERRIDE_KEY = "chat_provider_override";
+const CONVERSATION_PAGE_SIZE = 8;
 
 export function ChatPage() {
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
@@ -35,6 +36,10 @@ export function ChatPage() {
   const [sending, setSending] = useState(false);
   const [deletingConversationId, setDeletingConversationId] = useState<string | null>(null);
   const [conversationsOpen, setConversationsOpen] = useState(true);
+  const [loadingConversationList, setLoadingConversationList] = useState(false);
+  const [loadingMoreConversations, setLoadingMoreConversations] = useState(false);
+  const [conversationOffset, setConversationOffset] = useState(0);
+  const [hasMoreConversations, setHasMoreConversations] = useState(false);
   const [activePinnedProviderId, setActivePinnedProviderId] = useState<string | null>(null);
   const [activePinnedModelLabel, setActivePinnedModelLabel] = useState<string | null>(null);
   const clientTimezone = useMemo(
@@ -73,45 +78,78 @@ export function ChatPage() {
     setPendingOptions([]);
   }, []);
 
-  const loadConversations = useCallback(async (selectedConversationId?: string | null) => {
-    const list = await listConversations();
-    setConversations(list);
+  const loadConversationDetail = useCallback(async (conversationId: string) => {
+    const detail = await getConversation(conversationId);
+    setMessages(detail.messages);
+    setActivePinnedProviderId(detail.pinned_provider_id ?? null);
+    setActivePinnedModelLabel(
+      detail.pinned_provider_name && detail.pinned_model_name
+        ? `${detail.pinned_provider_name} / ${detail.pinned_model_name}`
+        : null
+    );
+    const lastAssistant = [...detail.messages].reverse().find((m) => m.role === "assistant");
+    setLatestCitations(lastAssistant?.citations ?? []);
+    setLastAssistantMessageId(lastAssistant?.id ?? null);
+    if (lastAssistant?.provider_name && lastAssistant?.model_name) {
+      setModelIndicator(`${lastAssistant.provider_name} / ${lastAssistant.model_name}`);
+    }
+  }, []);
 
-    if (selectedConversationId === null) {
-      clearConversationState();
+  const refreshConversations = useCallback(async (selectedConversationId?: string | null) => {
+    setLoadingConversationList(true);
+    try {
+      const list = await listConversations({ limit: CONVERSATION_PAGE_SIZE, offset: 0 });
+      setConversations(list);
+      setConversationOffset(list.length);
+      setHasMoreConversations(list.length === CONVERSATION_PAGE_SIZE);
+
+      if (selectedConversationId === null) {
+        clearConversationState();
+        return;
+      }
+
+      const target = selectedConversationId ?? list[0]?.id ?? null;
+      setActiveConversationId(target);
+      if (target) {
+        await loadConversationDetail(target);
+      } else {
+        clearConversationState();
+      }
+    } finally {
+      setLoadingConversationList(false);
+    }
+  }, [clearConversationState, loadConversationDetail]);
+
+  const loadMoreConversations = useCallback(async () => {
+    if (loadingMoreConversations || !hasMoreConversations) {
       return;
     }
-
-    const target = selectedConversationId ?? list[0]?.id ?? null;
-    setActiveConversationId(target);
-    if (target) {
-      const detail = await getConversation(target);
-      setMessages(detail.messages);
-      setActivePinnedProviderId(detail.pinned_provider_id ?? null);
-      setActivePinnedModelLabel(
-        detail.pinned_provider_name && detail.pinned_model_name
-          ? `${detail.pinned_provider_name} / ${detail.pinned_model_name}`
-          : null
-      );
-      const lastAssistant = [...detail.messages].reverse().find((m) => m.role === "assistant");
-      setLatestCitations(lastAssistant?.citations ?? []);
-      setLastAssistantMessageId(lastAssistant?.id ?? null);
-      if (lastAssistant?.provider_name && lastAssistant?.model_name) {
-        setModelIndicator(`${lastAssistant.provider_name} / ${lastAssistant.model_name}`);
-      }
-    } else {
-      clearConversationState();
+    setLoadingMoreConversations(true);
+    try {
+      const nextPage = await listConversations({
+        limit: CONVERSATION_PAGE_SIZE,
+        offset: conversationOffset,
+      });
+      setConversations((prev) => {
+        const existing = new Set(prev.map((item) => item.id));
+        return [...prev, ...nextPage.filter((item) => !existing.has(item.id))];
+      });
+      setConversationOffset((prev) => prev + nextPage.length);
+      setHasMoreConversations(nextPage.length === CONVERSATION_PAGE_SIZE);
+    } finally {
+      setLoadingMoreConversations(false);
     }
-  }, [clearConversationState]);
+  }, [conversationOffset, hasMoreConversations, loadingMoreConversations]);
 
   const startNewConversation = useCallback(() => {
     setStatusMessage(null);
     setError(null);
     clearConversationState();
+    setConversationsOpen(false);
   }, [clearConversationState]);
 
   useEffect(() => {
-    Promise.all([listProviders(), loadConversations(undefined)])
+    Promise.all([listProviders(), refreshConversations(undefined)])
       .then(([providersData]) => {
         setProviders(providersData);
         const persistedOverride = window.localStorage.getItem(CHAT_PROVIDER_OVERRIDE_KEY);
@@ -130,7 +168,7 @@ export function ChatPage() {
         }
       })
       .catch((err) => setError(err instanceof Error ? err.message : "Failed to initialize chat"));
-  }, [loadConversations]);
+  }, [refreshConversations]);
 
   const groupedMessages = useMemo(
     () => messages.filter((m) => m.role === "user" || m.role === "assistant"),
@@ -188,7 +226,7 @@ export function ChatPage() {
       } else if (response.safety_flags.length > 0) {
         setStatusMessage(`Safety flags: ${response.safety_flags.join(", ")}`);
       }
-      await loadConversations(response.conversation_id);
+      await refreshConversations(response.conversation_id);
       setPendingInteractionType(
         response.interaction_type === "confirmation_required" || response.interaction_type === "selection_required"
           ? response.interaction_type
@@ -223,7 +261,7 @@ export function ChatPage() {
       setModelIndicator(`${response.provider_name} / ${response.model_name}`);
       setLatestCitations(response.citations);
       setLastAssistantMessageId(response.assistant_message_id);
-      await loadConversations(response.conversation_id);
+      await refreshConversations(response.conversation_id);
       setPendingInteractionType(
         response.interaction_type === "confirmation_required" || response.interaction_type === "selection_required"
           ? response.interaction_type
@@ -256,7 +294,7 @@ export function ChatPage() {
       setModelIndicator(`${response.provider_name} / ${response.model_name}`);
       setLatestCitations(response.citations);
       setLastAssistantMessageId(response.assistant_message_id);
-      await loadConversations(response.conversation_id);
+      await refreshConversations(response.conversation_id);
       setPendingInteractionType(
         response.interaction_type === "confirmation_required" || response.interaction_type === "selection_required"
           ? response.interaction_type
@@ -297,13 +335,76 @@ export function ChatPage() {
       setPendingInteractionType(null);
       setPendingOptions([]);
       const nextSelection = activeConversationId === conversation.id ? undefined : activeConversationId;
-      await loadConversations(nextSelection);
+      await refreshConversations(nextSelection);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete conversation");
     } finally {
       setDeletingConversationId(null);
     }
   }
+
+  const renderConversationsList = () => (
+    <div className="flex h-full min-h-[320px] flex-col">
+      <div className="mb-2 flex items-center justify-between">
+        <h2 className="text-lg font-semibold">Conversations</h2>
+        <span className="text-xs text-slate-400">Recent first</span>
+      </div>
+      <div className="flex-1 space-y-2 overflow-y-auto pr-1">
+        {conversations.map((conv) => (
+          <div
+            className={`flex items-start gap-2 rounded border p-2 ${
+              conv.id === activeConversationId ? "border-accent bg-slate-900" : "border-slate-700"
+            }`}
+            key={conv.id}
+          >
+            <button
+              className="flex-1 text-left text-sm"
+              data-testid={`conversation-select-${conv.id}`}
+              onClick={async () => {
+                setPendingInteractionType(null);
+                setPendingOptions([]);
+                setError(null);
+                setStatusMessage(null);
+                setActiveConversationId(conv.id);
+                await loadConversationDetail(conv.id);
+                setConversationsOpen(false);
+              }}
+              type="button"
+            >
+              <div className="font-medium">{conv.title}</div>
+              <div className="text-xs text-slate-400">{new Date(conv.last_message_at).toLocaleString()}</div>
+            </button>
+            <button
+              className="shrink-0 rounded border border-red-500/60 px-3 py-2 text-xs text-red-300 disabled:opacity-50"
+              data-testid={`conversation-delete-${conv.id}`}
+              disabled={deletingConversationId === conv.id}
+              onClick={() => onDeleteConversation(conv)}
+              type="button"
+            >
+              {deletingConversationId === conv.id ? "Deleting..." : "Delete"}
+            </button>
+          </div>
+        ))}
+        {!loadingConversationList && conversations.length === 0 && <p className="text-sm text-slate-400">No conversations yet.</p>}
+      </div>
+      <div className="mt-3 flex items-center justify-between gap-2">
+        {loadingConversationList && <p className="text-xs text-slate-400">Loading conversations...</p>}
+        {!loadingConversationList && hasMoreConversations && (
+          <button
+            className="rounded border border-slate-700 px-3 py-1.5 text-xs disabled:opacity-50"
+            data-testid="conversations-show-more"
+            disabled={loadingMoreConversations}
+            onClick={() => {
+              void loadMoreConversations();
+            }}
+            type="button"
+          >
+            {loadingMoreConversations ? "Loading..." : "Show more"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
 
   return (
     <main className="mx-auto max-w-[1400px] p-6">
@@ -318,11 +419,11 @@ export function ChatPage() {
             New
           </button>
           <button
-            className="rounded border border-slate-700 px-3 py-2 text-sm"
+            className="rounded border border-slate-700 px-3 py-2 text-sm lg:hidden"
             onClick={() => setConversationsOpen((value) => !value)}
             type="button"
           >
-            {conversationsOpen ? "Hide Conversations" : "Show Conversations"}
+            {conversationsOpen ? "Close Conversations" : "Conversations"}
           </button>
           <Link className="text-sm text-accent underline" to="/">
             Back to dashboard
@@ -346,48 +447,24 @@ export function ChatPage() {
       )}
       {statusMessage && <div className="mb-4 rounded bg-amber-500/15 p-3 text-amber-200">{statusMessage}</div>}
 
-      <div className={`grid gap-4 ${conversationsOpen ? "lg:grid-cols-[320px,1fr,340px]" : "lg:grid-cols-[1fr,340px]"}`}>
-        {conversationsOpen && (
-          <aside className="rounded-lg bg-panel p-4">
-          <div className="mb-2 flex items-center justify-between">
-            <h2 className="text-lg font-semibold">Conversations</h2>
-          </div>
-          <div className="space-y-2">
-            {conversations.map((conv) => (
-              <div
-                className={`flex items-start gap-2 rounded border p-2 ${
-                  conv.id === activeConversationId ? "border-accent bg-slate-900" : "border-slate-700"
-                }`}
-                key={conv.id}
-              >
-                <button
-                  className="flex-1 text-left text-sm"
-                  data-testid={`conversation-select-${conv.id}`}
-                  onClick={async () => {
-                    setPendingInteractionType(null);
-                    setPendingOptions([]);
-                    await loadConversations(conv.id);
-                  }}
-                  type="button"
-                >
-                  <div className="font-medium">{conv.title}</div>
-                  <div className="text-xs text-slate-400">{new Date(conv.last_message_at).toLocaleString()}</div>
-                </button>
-                <button
-                  className="shrink-0 rounded border border-red-500/60 px-3 py-2 text-xs text-red-300 disabled:opacity-50"
-                  data-testid={`conversation-delete-${conv.id}`}
-                  disabled={deletingConversationId === conv.id}
-                  onClick={() => onDeleteConversation(conv)}
-                  type="button"
-                >
-                  {deletingConversationId === conv.id ? "Deleting..." : "Delete"}
-                </button>
-              </div>
-            ))}
-            {conversations.length === 0 && <p className="text-sm text-slate-400">No conversations yet.</p>}
-          </div>
-          </aside>
-        )}
+      {conversationsOpen && (
+        <button
+          aria-label="Close conversations drawer"
+          className="fixed inset-0 z-20 bg-black/60 lg:hidden"
+          onClick={() => setConversationsOpen(false)}
+          type="button"
+        />
+      )}
+
+      <div className="grid gap-4 lg:grid-cols-[320px,1fr,340px]">
+        <aside
+          className={`${
+            conversationsOpen ? "fixed inset-y-0 left-0 z-30 w-[85%] max-w-sm" : "hidden"
+          } h-full overflow-hidden rounded-r-lg bg-panel p-4 lg:static lg:z-auto lg:block lg:h-[calc(100vh-160px)] lg:w-auto lg:max-w-none lg:rounded-lg`}
+          data-testid="conversations-panel"
+        >
+          {renderConversationsList()}
+        </aside>
 
         <section className="rounded-lg bg-panel p-4">
           <div className="mb-3 grid gap-2 md:grid-cols-2">

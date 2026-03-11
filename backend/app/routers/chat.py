@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_tenant_membership, get_db
@@ -86,10 +86,19 @@ def complete_chat(
 
 @router.get("/conversations", response_model=list[ConversationSummary])
 def conversations(
+    limit: int = Query(default=50, ge=1, description="Number of conversations to return"),
+    offset: int = Query(default=0, ge=0, description="Number of conversations to skip"),
     membership: TenantMembership = Depends(get_current_tenant_membership),
     db: Session = Depends(get_db),
 ) -> list[ConversationSummary]:
-    return list_conversations(db, tenant_id=membership.tenant_id, user_id=membership.user_id)
+    bounded_limit = min(limit, 100)
+    return list_conversations(
+        db,
+        tenant_id=membership.tenant_id,
+        user_id=membership.user_id,
+        limit=bounded_limit,
+        offset=offset,
+    )
 
 
 @router.get("/conversations/{conversation_id}", response_model=ConversationDetail)

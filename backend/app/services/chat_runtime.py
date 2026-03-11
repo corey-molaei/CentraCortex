@@ -816,12 +816,20 @@ def run_chat_v2(
     )
 
 
-def list_conversations(db: Session, *, tenant_id: str, user_id: str, limit: int = 50) -> list[ConversationSummary]:
+def list_conversations(
+    db: Session,
+    *,
+    tenant_id: str,
+    user_id: str,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[ConversationSummary]:
     rows = (
         db.execute(
             select(ChatConversation)
             .where(ChatConversation.tenant_id == tenant_id, ChatConversation.user_id == user_id)
             .order_by(ChatConversation.last_message_at.desc())
+            .offset(offset)
             .limit(limit)
         )
         .scalars()
