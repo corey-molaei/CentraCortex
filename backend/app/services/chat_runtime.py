@@ -19,11 +19,9 @@ from app.models.document_chunk import DocumentChunk
 from app.models.llm_provider import LLMProvider
 from app.schemas.llm import Citation, ConversationDetail, ConversationMessageRead, ConversationSummary
 from app.services.acl import get_accessible_documents
-from app.services.chat_calendar_actions import maybe_handle_calendar_chat_action
-from app.services.chat_contacts_actions import maybe_handle_contacts_chat_action
-from app.services.chat_email_actions import maybe_handle_email_chat_action
 from app.services.document_indexing import ChunkSearchResult, hybrid_search_chunks
 from app.services.llm_router import LLMRouter
+from app.services.tool_plan_dispatcher import dispatch_tool_plan_v1
 
 SYSTEM_PROMPT = (
     "You are CentraCortex Assistant. Use the provided context and tenant-safe reasoning. "
@@ -673,109 +671,35 @@ def run_chat(
             "safety_flags": safety.flags,
         }
 
-    calendar_action = maybe_handle_calendar_chat_action(
+    tool_dispatch = dispatch_tool_plan_v1(
         db,
         tenant_id=tenant_id,
         user_id=user_id,
         conversation_id=conversation.id,
         message=last_user_msg,
+        provider_id_override=effective_provider_id,
         client_timezone=client_timezone,
         client_now_iso=client_now_iso,
-        provider_id_override=effective_provider_id,
     )
-    if calendar_action and calendar_action.handled:
+    if tool_dispatch and tool_dispatch.handled:
         assistant_msg = _save_message(
             db,
             tenant_id=tenant_id,
             conversation=conversation,
             user_id=None,
             role="assistant",
-            content=calendar_action.answer,
+            content=tool_dispatch.answer,
             citations=[],
             safety_flags=safety.flags,
-            llm_model_name="google-calendar-action",
+            llm_model_name=tool_dispatch.model_name,
         )
         action_provider = SimpleNamespace(
-            id="google-calendar-action",
-            name="Calendar Action Engine",
-            model_name="google-calendar-action",
+            id=tool_dispatch.provider_id or "tool-planner",
+            name=tool_dispatch.provider_name or "Tool Planner",
+            model_name=tool_dispatch.model_name or "tool-planner",
         )
         return conversation, assistant_msg, action_provider, {
-            "answer": calendar_action.answer,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-            "citations": [],
-            "blocked": False,
-            "safety_flags": safety.flags,
-        }
-
-    contacts_action = maybe_handle_contacts_chat_action(
-        db,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        conversation_id=conversation.id,
-        message=last_user_msg,
-        provider_id_override=effective_provider_id,
-    )
-    if contacts_action and contacts_action.handled:
-        assistant_msg = _save_message(
-            db,
-            tenant_id=tenant_id,
-            conversation=conversation,
-            user_id=None,
-            role="assistant",
-            content=contacts_action.answer,
-            citations=[],
-            safety_flags=safety.flags,
-            llm_model_name="contacts-action",
-        )
-        action_provider = SimpleNamespace(
-            id="contacts-action",
-            name="Contacts Action Engine",
-            model_name="contacts-action",
-        )
-        return conversation, assistant_msg, action_provider, {
-            "answer": contacts_action.answer,
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-            "citations": [],
-            "blocked": False,
-            "safety_flags": safety.flags,
-        }
-
-    email_action = maybe_handle_email_chat_action(
-        db,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        conversation_id=conversation.id,
-        message=last_user_msg,
-        client_timezone=client_timezone,
-        client_now_iso=client_now_iso,
-        provider_id_override=effective_provider_id,
-    )
-    if email_action and email_action.handled:
-        assistant_msg = _save_message(
-            db,
-            tenant_id=tenant_id,
-            conversation=conversation,
-            user_id=None,
-            role="assistant",
-            content=email_action.answer,
-            citations=[],
-            safety_flags=safety.flags,
-            llm_model_name="email-action",
-        )
-        action_provider = SimpleNamespace(
-            id="email-action",
-            name="Email Action Engine",
-            model_name="email-action",
-        )
-        return conversation, assistant_msg, action_provider, {
-            "answer": email_action.answer,
+            "answer": tool_dispatch.answer,
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,

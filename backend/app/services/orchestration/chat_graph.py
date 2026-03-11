@@ -21,6 +21,7 @@ from app.services.orchestration.calendar_graph import run_calendar_subgraph
 from app.services.orchestration.contacts_graph import run_contacts_subgraph
 from app.services.orchestration.email_graph import run_email_subgraph
 from app.services.orchestration.state import GraphState
+from app.services.tool_plan_dispatcher import dispatch_tool_plan_v2
 
 try:  # pragma: no cover - optional dependency
     from langgraph.graph import END, StateGraph
@@ -33,27 +34,7 @@ logger = structlog.get_logger(__name__)
 
 GRAPH_NAME = "chat_main_graph"
 
-CALENDAR_TOKENS = {
-    "calendar",
-    "calendars",
-    "event",
-    "events",
-    "meeting",
-    "meetings",
-    "schedule",
-}
-EMAIL_TOKENS = {
-    "email",
-    "emails",
-    "gmail",
-    "inbox",
-    "mail",
-    "mails",
-    "send",
-    "smtp",
-}
 AGENT_TOKENS = {"agent", "tool", "approval", "workflow"}
-CONTACTS_TOKENS = {"contact", "contacts", "person", "people", "addressbook"}
 CALENDAR_PENDING_ACTION_TYPES = {"calendar_create", "calendar_update", "calendar_delete"}
 CONTACTS_PENDING_ACTION_TYPES = {"contacts_create", "contacts_update", "contacts_delete"}
 
@@ -235,16 +216,10 @@ def _intent_router_node(state: GraphState) -> GraphState:
     lowered = state["latest_user_message"].lower()
     tokens = set(lowered.replace("/", " ").replace(",", " ").split())
 
-    if tokens.intersection(CALENDAR_TOKENS):
-        state["intent"] = "calendar"
-    elif tokens.intersection(CONTACTS_TOKENS):
-        state["intent"] = "contacts"
-    elif tokens.intersection(EMAIL_TOKENS):
-        state["intent"] = "email"
-    elif tokens.intersection(AGENT_TOKENS):
+    if tokens.intersection(AGENT_TOKENS):
         state["intent"] = "agent"
     else:
-        state["intent"] = "knowledge"
+        state["intent"] = "tool_plan"
 
     _checkpoint(state, "intent_router")
     return state
@@ -296,6 +271,17 @@ def _dispatch_node(state: GraphState) -> GraphState:
             tenant_id=state["tenant_id"],
             user_id=state["user_id"],
             message=state["latest_user_message"],
+        )
+    elif intent == "tool_plan":
+        result = dispatch_tool_plan_v2(
+            db,
+            tenant_id=state["tenant_id"],
+            user_id=state["user_id"],
+            conversation_id=state["conversation_id"],
+            message=state["latest_user_message"],
+            provider_id_override=state.get("effective_provider_id"),
+            client_timezone=state.get("client_timezone"),
+            client_now_iso=state.get("client_now_iso"),
         )
 
     if result and result.get("intent_handled"):

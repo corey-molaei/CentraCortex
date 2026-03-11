@@ -12,6 +12,7 @@ from app.models.tenant import Tenant
 from app.models.tenant_membership import TenantMembership
 from app.models.user import User
 from app.services.chat_calendar_actions import ParsedCalendarIntent
+from app.services.tool_plan_dispatcher import ToolPlan, ToolStep
 
 
 def _seed_and_login(client, db_session) -> str:
@@ -596,6 +597,90 @@ def test_chat_v2_send_email_natural_phrase_uses_cleaned_draft(client, db_session
     assert "body preview: let's have fun after work tomorrow" in payload["answer"].lower()
     assert "body preview: say let's have fun after work tomorrow" not in payload["answer"].lower()
     assert "Subject: (No subject)" not in payload["answer"]
+
+
+def test_chat_v2_tool_plan_contacts_search_then_send(client, db_session, monkeypatch):
+    token = _seed_and_login(client, db_session)
+    membership = db_session.query(TenantMembership).first()
+    assert membership is not None
+    user = db_session.query(User).filter(User.id == membership.user_id).one()
+    _seed_google_account(
+        db_session,
+        tenant_id=membership.tenant_id,
+        user_id=membership.user_id,
+        email=user.email,
+        contacts_enabled=True,
+        scopes=[
+            "https://www.googleapis.com/auth/contacts.readonly",
+            "https://www.googleapis.com/auth/contacts",
+        ],
+    )
+
+    monkeypatch.setattr("app.core.config.settings.google_client_id", "google-client-id")
+    monkeypatch.setattr("app.core.config.settings.google_client_secret", "google-client-secret")
+    monkeypatch.setattr(
+        "app.services.tool_plan_dispatcher._parse_tool_plan_llm",
+        lambda *args, **kwargs: (
+            ToolPlan(
+                steps=[
+                    ToolStep(tool="contacts.search", args={"query": "maryam asadi"}),
+                    ToolStep(tool="email.send_draft", args={}),
+                ]
+            ),
+            False,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.tool_plan_dispatcher.search_contacts",
+        lambda *args, **kwargs: [
+            {
+                "resource_name": "people/maryam",
+                "display_name": "Maryam Asadi",
+                "primary_email": "maryam@example.com",
+            }
+        ],
+    )
+
+    response = client.post(
+        "/api/v2/chat/complete",
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "send email to maryam asadi title test body just checking",
+                }
+            ]
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider_name"] == "Email Action Engine"
+    assert payload["interaction_type"] == "confirmation_required"
+    assert "maryam@example.com" in payload["answer"]
+
+
+def test_chat_v2_tool_plan_parser_failure_returns_clarification(client, db_session, monkeypatch):
+    token = _seed_and_login(client, db_session)
+    membership = db_session.query(TenantMembership).first()
+    assert membership is not None
+    _seed_provider(db_session, tenant_id=membership.tenant_id, is_default=True)
+
+    monkeypatch.setattr(
+        "app.services.tool_plan_dispatcher._parse_tool_plan_llm",
+        lambda *args, **kwargs: (None, True),
+    )
+
+    response = client.post(
+        "/api/v2/chat/complete",
+        json={"messages": [{"role": "user", "content": "today's emails"}]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["provider_name"] == "Tool Planner"
+    assert payload["interaction_type"] == "execution_result"
+    assert "couldn't confidently map this request" in payload["answer"].lower()
 
 
 def test_chat_v2_create_natural_phrase_returns_confirmation_required(client, db_session, monkeypatch):

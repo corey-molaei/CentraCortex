@@ -1,4 +1,5 @@
 import os
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -68,3 +69,77 @@ def local_qdrant_for_tests(monkeypatch, tmp_path):
         close = getattr(client, "close", None)
         if callable(close):
             close()
+
+
+def _extract_recipient_name_hint(message: str) -> str | None:
+    normalized = " ".join(message.split())
+    match = re.search(
+        r"\bto\s+(.+?)(?:\s+\b(?:subject|title|body|about|cc|bcc)\b|$)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    value = match.group(1).strip(" .,")
+    if not value:
+        return None
+    if re.search(r"\b[\w.\-+]+@[\w.\-]+\.\w+\b", value, re.IGNORECASE):
+        return None
+    return value
+
+
+@pytest.fixture(autouse=True)
+def mock_tool_plan_parser(monkeypatch, request):
+    if request.node.get_closest_marker("use_real_tool_planner"):
+        yield
+        return
+
+    from app.services import tool_plan_dispatcher
+
+    def _fake_parse_tool_plan_llm(*args, **kwargs):  # noqa: ARG001
+        message = str(kwargs.get("message") or "")
+        lowered = message.lower()
+        tokens = set(re.findall(r"[a-z0-9_]+", lowered))
+        steps: list[tool_plan_dispatcher.ToolStep] = []
+
+        if "send" in tokens and ("email" in tokens or "mail" in tokens):
+            has_explicit_email = bool(re.search(r"\b[\w.\-+]+@[\w.\-]+\.\w+\b", message, re.IGNORECASE))
+            if has_explicit_email:
+                steps = [tool_plan_dispatcher.ToolStep(tool="email.send_draft", args={})]
+            else:
+                name_hint = _extract_recipient_name_hint(message) or "contact"
+                steps = [
+                    tool_plan_dispatcher.ToolStep(tool="contacts.search", args={"query": name_hint}),
+                    tool_plan_dispatcher.ToolStep(tool="email.send_draft", args={}),
+                ]
+        elif tokens.intersection({"contact", "contacts", "people", "person", "addressbook"}) or "email of" in lowered:
+            if tokens.intersection({"delete", "remove"}):
+                steps = [tool_plan_dispatcher.ToolStep(tool="contacts.delete", args={})]
+            elif tokens.intersection({"update", "change", "edit"}):
+                steps = [tool_plan_dispatcher.ToolStep(tool="contacts.update", args={})]
+            elif tokens.intersection({"find", "search", "lookup"}) or "email of" in lowered:
+                steps = [tool_plan_dispatcher.ToolStep(tool="contacts.search", args={})]
+            elif "read" in tokens:
+                steps = [tool_plan_dispatcher.ToolStep(tool="contacts.read", args={})]
+            else:
+                steps = [tool_plan_dispatcher.ToolStep(tool="contacts.list", args={})]
+        elif tokens.intersection({"calendar", "calendars", "meeting", "meetings", "event", "events", "schedule", "standup"}):
+            if tokens.intersection({"delete", "cancel", "remove"}):
+                steps = [tool_plan_dispatcher.ToolStep(tool="calendar.delete", args={})]
+            elif tokens.intersection({"update", "move", "reschedule"}):
+                steps = [tool_plan_dispatcher.ToolStep(tool="calendar.update", args={})]
+            elif tokens.intersection({"list", "upcoming", "show"}):
+                steps = [tool_plan_dispatcher.ToolStep(tool="calendar.list", args={})]
+            else:
+                steps = [tool_plan_dispatcher.ToolStep(tool="calendar.create", args={})]
+        elif tokens.intersection({"email", "emails", "inbox", "gmail", "mail", "mails"}):
+            if "read" in tokens:
+                steps = [tool_plan_dispatcher.ToolStep(tool="email.read", args={})]
+            else:
+                steps = [tool_plan_dispatcher.ToolStep(tool="email.list", args={})]
+
+        plan = tool_plan_dispatcher.ToolPlan(steps=steps, confidence=0.9, reason="test-mock")
+        return plan, False
+
+    monkeypatch.setattr(tool_plan_dispatcher, "_parse_tool_plan_llm", _fake_parse_tool_plan_llm)
+    yield
