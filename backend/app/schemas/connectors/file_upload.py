@@ -4,7 +4,7 @@ from app.schemas.connectors.common import ConnectorStatus
 
 
 class FileConnectorConfig(BaseModel):
-    allowed_extensions: list[str] = Field(default_factory=lambda: ["txt", "pdf", "docx"])
+    allowed_extensions: list[str] = Field(default_factory=lambda: ["txt", "pdf", "docx", "xls", "xlsx", "doc"])
     enabled: bool = True
 
 

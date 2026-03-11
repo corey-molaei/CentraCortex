@@ -13,7 +13,7 @@ from app.models.document import Document
 from app.models.tenant import Tenant
 from app.models.tenant_membership import TenantMembership
 from app.models.user import User
-from app.services.connectors.google_service import _extract_drive_text
+from app.services.connectors.google_service import _extract_drive_text, _extract_drive_text_result
 from app.tasks.celery_app import sync_google_connectors
 
 
@@ -921,16 +921,23 @@ def test_missing_google_credentials_returns_400(client, db_session, monkeypatch)
     assert "GOOGLE_CLIENT_ID" in response.json()["detail"]
 
 
-def test_extract_drive_text_reads_plain_text_via_alt_media(monkeypatch):
+def test_extract_drive_text_reads_supported_file_via_binary_download(monkeypatch):
     captured: dict[str, object] = {}
 
-    def fake_text_request(*, access_token: str, url: str, params: dict | None = None) -> str:
+    def fake_binary_request(*, access_token: str, url: str, params: dict | None = None) -> bytes:
         captured["access_token"] = access_token
         captured["url"] = url
         captured["params"] = params
-        return "plain text from drive"
+        return b"plain text from drive"
 
-    monkeypatch.setattr("app.services.connectors.google_service._google_text_request", fake_text_request)
+    class DummyExtracted:
+        text = "plain text from drive"
+        extractor = "utf8"
+        warning = None
+        metadata = {"extension": "txt"}
+
+    monkeypatch.setattr("app.services.connectors.google_service._google_binary_request", fake_binary_request)
+    monkeypatch.setattr("app.services.connectors.google_service.extract_text_from_file_bytes", lambda **kwargs: DummyExtracted())
 
     extracted = _extract_drive_text(
         access_token="token-x",
@@ -957,3 +964,16 @@ def test_extract_drive_text_falls_back_when_binary_download_fails(monkeypatch):
     )
 
     assert extracted == "Drive file: archive.zip"
+
+
+def test_extract_drive_text_result_marks_unsupported_files_as_skipped():
+    result = _extract_drive_text_result(
+        access_token="token-x",
+        file_id="file-3",
+        name="archive.zip",
+        mime_type="application/zip",
+    )
+
+    assert result.status == "skipped"
+    assert result.raw_text == "Drive file: archive.zip"
+    assert result.extractor == "none"

@@ -15,7 +15,7 @@ vi.mock("../../api/connectors", () => connectorApi);
 describe("FileUploadConnectorPage", () => {
   it("shows validation error when uploading without selecting files", async () => {
     connectorApi.getConnectorConfig.mockResolvedValue({
-      allowed_extensions: ["txt", "pdf", "docx"],
+      allowed_extensions: ["txt", "pdf", "docx", "xls", "xlsx", "doc"],
       status: {
         enabled: true,
         last_sync_at: null,

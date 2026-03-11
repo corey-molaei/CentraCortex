@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from io import BytesIO
-from pathlib import Path
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -21,17 +20,8 @@ from app.models.connector_oauth_state import ConnectorOAuthState
 from app.models.connectors.google_user_connector import GoogleUserConnector
 from app.models.document import Document
 from app.services.connectors.common import finish_sync_run, start_sync_run, upsert_document
+from app.services.connectors.file_text_extractor import can_extract_text, extract_text_from_file_bytes
 from app.services.document_indexing import soft_delete_document
-
-try:
-    from docx import Document as DocxDocument
-except Exception:  # pragma: no cover
-    DocxDocument = None
-
-try:
-    from pypdf import PdfReader
-except Exception:  # pragma: no cover
-    PdfReader = None
 
 GOOGLE_OAUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -42,6 +32,15 @@ GOOGLE_DRIVE_BASE_URL = "https://www.googleapis.com/drive/v3"
 GOOGLE_SHEETS_BASE_URL = "https://sheets.googleapis.com/v4/spreadsheets"
 GOOGLE_PEOPLE_BASE_URL = "https://people.googleapis.com/v1"
 logger = structlog.get_logger(__name__)
+
+
+@dataclass
+class DriveTextExtractionResult:
+    raw_text: str
+    extractor: str
+    status: str
+    warning: str | None = None
+    metadata: dict | None = None
 
 
 def _utcnow() -> datetime:
@@ -214,37 +213,72 @@ def _google_binary_request(*, access_token: str, url: str, params: dict | None =
 
 
 def _extract_drive_text(*, access_token: str, file_id: str, name: str, mime_type: str) -> str:
+    return _extract_drive_text_result(
+        access_token=access_token,
+        file_id=file_id,
+        name=name,
+        mime_type=mime_type,
+    ).raw_text
+
+
+def _extract_drive_text_result(*, access_token: str, file_id: str, name: str, mime_type: str) -> DriveTextExtractionResult:
     fallback = f"Drive file: {name}"
     if not file_id:
-        return fallback
+        return DriveTextExtractionResult(raw_text=fallback, extractor="none", status="failed", warning="Missing file id")
 
     lower_mime = (mime_type or "").lower()
-    extension = Path(name).suffix.lower().lstrip(".")
 
     if lower_mime == "application/vnd.google-apps.document":
         try:
-            return _google_text_request(
+            text = _google_text_request(
                 access_token=access_token,
                 url=f"{GOOGLE_DRIVE_BASE_URL}/files/{quote(file_id, safe='')}/export",
                 params={"mimeType": "text/plain"},
             )
-        except Exception:
-            return fallback
-
-    if lower_mime.startswith("text/") or lower_mime in {
-        "application/json",
-        "application/xml",
-        "text/csv",
-        "application/csv",
-    }:
-        try:
-            return _google_text_request(
-                access_token=access_token,
-                url=f"{GOOGLE_DRIVE_BASE_URL}/files/{quote(file_id, safe='')}",
-                params={"alt": "media"},
+            cleaned = text.strip()
+            if cleaned:
+                return DriveTextExtractionResult(
+                    raw_text=cleaned,
+                    extractor="google_docs_export",
+                    status="success",
+                )
+            return DriveTextExtractionResult(
+                raw_text=fallback,
+                extractor="google_docs_export",
+                status="failed",
+                warning="Google Docs export returned empty text",
             )
-        except Exception:
-            return fallback
+        except Exception as exc:
+            return DriveTextExtractionResult(
+                raw_text=fallback,
+                extractor="google_docs_export",
+                status="failed",
+                warning=str(exc),
+            )
+
+    if lower_mime == "application/vnd.google-apps.spreadsheet":
+        return DriveTextExtractionResult(
+            raw_text=fallback,
+            extractor="none",
+            status="skipped",
+            warning="Google Sheets native files are ingested via the Sheets connector",
+        )
+
+    if lower_mime.startswith("application/vnd.google-apps."):
+        return DriveTextExtractionResult(
+            raw_text=fallback,
+            extractor="none",
+            status="skipped",
+            warning="Google native file type is not supported in Drive binary ingestion",
+        )
+
+    if not can_extract_text(filename=name, mime_type=lower_mime):
+        return DriveTextExtractionResult(
+            raw_text=fallback,
+            extractor="none",
+            status="skipped",
+            warning=f"Unsupported Drive file type: {mime_type or 'unknown'}",
+        )
 
     try:
         payload = _google_binary_request(
@@ -252,40 +286,52 @@ def _extract_drive_text(*, access_token: str, file_id: str, name: str, mime_type
             url=f"{GOOGLE_DRIVE_BASE_URL}/files/{quote(file_id, safe='')}",
             params={"alt": "media"},
         )
-    except Exception:
-        return fallback
+    except Exception as exc:
+        return DriveTextExtractionResult(
+            raw_text=fallback,
+            extractor="none",
+            status="failed",
+            warning=str(exc),
+        )
 
     if not payload:
-        return fallback
+        return DriveTextExtractionResult(
+            raw_text=fallback,
+            extractor="none",
+            status="failed",
+            warning="Drive download returned empty payload",
+        )
 
-    if lower_mime == "application/pdf" and PdfReader is not None:
-        try:
-            reader = PdfReader(BytesIO(payload))
-            text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
-            return text or fallback
-        except Exception:
-            return fallback
+    try:
+        extracted = extract_text_from_file_bytes(
+            filename=name,
+            content=payload,
+            mime_type=lower_mime,
+        )
+    except ValueError as exc:
+        return DriveTextExtractionResult(
+            raw_text=fallback,
+            extractor="none",
+            status="failed",
+            warning=str(exc),
+        )
 
-    if (
-        lower_mime
-        in {
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/msword",
-        }
-        or extension == "docx"
-    ) and DocxDocument is not None:
-        try:
-            doc = DocxDocument(BytesIO(payload))
-            text = "\n".join(p.text for p in doc.paragraphs).strip()
-            return text or fallback
-        except Exception:
-            return fallback
-
-    if extension in {"txt", "md", "csv", "json"}:
-        decoded = payload.decode("utf-8", errors="ignore").strip()
-        return decoded or fallback
-
-    return fallback
+    text = extracted.text.strip()
+    if not text:
+        return DriveTextExtractionResult(
+            raw_text=fallback,
+            extractor=extracted.extractor,
+            status="failed",
+            warning="No extractable text content found",
+            metadata=extracted.metadata,
+        )
+    return DriveTextExtractionResult(
+        raw_text=text,
+        extractor=extracted.extractor,
+        status="success",
+        warning=extracted.warning,
+        metadata=extracted.metadata,
+    )
 
 
 def _exchange_token(data: dict[str, str]) -> dict:
@@ -1231,12 +1277,23 @@ def _upsert_drive_document(
     modified_time = str(item.get("modifiedTime") or "")
     source_updated_at = _parse_google_datetime(modified_time)
 
-    raw_text = _extract_drive_text(
+    extraction = _extract_drive_text_result(
         access_token=access_token,
         file_id=file_id,
         name=name,
         mime_type=mime_type,
     )
+    if extraction.status != "success":
+        logger.warning(
+            "google_drive_extraction_issue",
+            connector_account_id=connector.id,
+            file_id=file_id,
+            file_name=name,
+            mime_type=mime_type,
+            extraction_status=extraction.status,
+            extractor=extraction.extractor,
+            warning=extraction.warning,
+        )
 
     owner_email = None
     owners = item.get("owners") or []
@@ -1252,7 +1309,7 @@ def _upsert_drive_document(
         author=owner_email or connector.google_account_email,
         source_created_at=source_updated_at,
         source_updated_at=source_updated_at,
-        raw_text=raw_text,
+        raw_text=extraction.raw_text,
         acl_policy_id=acl_policy_id,
         metadata_json={
             "google_connector_account_id": connector.id,
@@ -1260,6 +1317,10 @@ def _upsert_drive_document(
             "google_account_sub": connector.google_account_sub,
             "file_id": file_id,
             "mime_type": mime_type,
+            "extraction_status": extraction.status,
+            "extractor": extraction.extractor,
+            "extraction_warning": extraction.warning,
+            "extraction_metadata": extraction.metadata or {},
         },
     )
     return 1

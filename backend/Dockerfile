@@ -8,6 +8,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
+    antiword \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.deploy.txt /app/requirements.deploy.txt

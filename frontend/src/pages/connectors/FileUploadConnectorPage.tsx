@@ -8,7 +8,7 @@ import { PageContainer } from "../../layout/PageContainer";
 import type { ConnectorStatus, SyncRun } from "../../types/connectors";
 
 export function FileUploadConnectorPage() {
-  const [allowedExtensions, setAllowedExtensions] = useState("txt,pdf,docx");
+  const [allowedExtensions, setAllowedExtensions] = useState("txt,pdf,docx,xls,xlsx,doc");
   const [enabled, setEnabled] = useState(true);
   const [files, setFiles] = useState<File[]>([]);
   const [status, setStatus] = useState<ConnectorStatus | null>(null);
@@ -101,7 +101,7 @@ export function FileUploadConnectorPage() {
               <input
                 className="w-full rounded-lg border border-white/15 bg-white/5 p-2 text-sm"
                 onChange={(e) => setAllowedExtensions(e.target.value)}
-                placeholder="txt,pdf,docx"
+                placeholder="txt,pdf,docx,xls,xlsx,doc"
                 value={allowedExtensions}
               />
               <label className="flex items-center gap-2 text-sm text-slate-200">

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from io import BytesIO
+
 import pytest
 from sqlalchemy import select
 
@@ -229,6 +231,74 @@ def test_file_upload_connector_rejects_disallowed_extension(client, db_session):
     ).scalars().all()
     assert len(runs) == 1
     assert runs[0].status == "failed"
+
+
+def test_file_upload_connector_ingests_xlsx(client, db_session):
+    openpyxl = pytest.importorskip("openpyxl")
+    tenant, _ = _seed_admin(db_session)
+    db_session.add(FileConnector(tenant_id=tenant.id, allowed_extensions=["txt", "xlsx"]))
+    db_session.commit()
+
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Leads"
+    worksheet.append(["Name", "Email"])
+    worksheet.append(["Maryam Asadi", "maryam@example.com"])
+    stream = BytesIO()
+    workbook.save(stream)
+
+    token = _login(client)
+    response = client.post(
+        "/api/v1/connectors/file-upload/upload",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[
+            (
+                "files",
+                (
+                    "leads.xlsx",
+                    stream.getvalue(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ),
+            )
+        ],
+    )
+    assert response.status_code == 200
+
+    docs = db_session.execute(
+        select(Document).where(Document.tenant_id == tenant.id, Document.source_type == "file_upload")
+    ).scalars().all()
+    assert len(docs) == 1
+    assert "Maryam Asadi, maryam@example.com" in docs[0].raw_text
+
+
+def test_file_upload_connector_ingests_doc_when_antiword_parses(client, db_session, monkeypatch):
+    tenant, _ = _seed_admin(db_session)
+    db_session.add(FileConnector(tenant_id=tenant.id, allowed_extensions=["doc"]))
+    db_session.commit()
+
+    def fake_run(*args, **kwargs):  # noqa: ARG001
+        class Proc:
+            returncode = 0
+            stdout = "Legacy DOC content"
+            stderr = ""
+
+        return Proc()
+
+    monkeypatch.setattr("app.services.connectors.file_text_extractor.subprocess.run", fake_run)
+
+    token = _login(client)
+    response = client.post(
+        "/api/v1/connectors/file-upload/upload",
+        headers={"Authorization": f"Bearer {token}"},
+        files=[("files", ("legacy.doc", b"doc bytes", "application/msword"))],
+    )
+    assert response.status_code == 200
+
+    docs = db_session.execute(
+        select(Document).where(Document.tenant_id == tenant.id, Document.source_type == "file_upload")
+    ).scalars().all()
+    assert len(docs) == 1
+    assert "Legacy DOC content" in docs[0].raw_text
 
 
 def test_email_legacy_endpoints_return_gone(client, db_session):
