@@ -44,6 +44,7 @@ class GraphState(TypedDict, total=False):
     provider_id_override: str | None
     effective_provider_id: str | None
     retrieval_limit: int
+    history_turn_limit: int
 
     safety_flags: list[str]
     blocked: bool

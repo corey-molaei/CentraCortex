@@ -1,11 +1,19 @@
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
+from sqlalchemy import select
 
 from app.core.security import encrypt_secret, get_password_hash
+from app.models.audit_log import AuditLog
 from app.models.channel_telegram_connector import ChannelTelegramConnector
+from app.models.chat_conversation import ChatConversation
 from app.models.connectors.google_user_connector import GoogleUserConnector
+from app.models.conversation_contact_link import ConversationContactLink
 from app.models.tenant import Tenant
 from app.models.tenant_membership import TenantMembership
 from app.models.user import User
+from app.models.workspace_contact import WorkspaceContact
+from app.services.channel_dispatcher import run_channel_message
 
 
 def _seed_tenant_with_owner(db_session, *, email: str) -> tuple[Tenant, User]:
@@ -213,3 +221,223 @@ def test_telegram_public_webhook_ignores_non_text_updates(client, db_session, mo
     body = response.json()
     assert body["ok"] is True
     assert body["ignored"] is True
+
+
+def test_channel_message_reuses_active_conversation_and_history_50(db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_owner(db_session, email="channels-sticky@example.com")
+    conversation = ChatConversation(tenant_id=tenant.id, user_id=user.id, title="Sticky")
+    db_session.add(conversation)
+    db_session.flush()
+    contact = WorkspaceContact(
+        tenant_id=tenant.id,
+        channel="telegram",
+        external_user_id="user-1",
+        name="User One",
+        active_conversation_id=conversation.id,
+    )
+    db_session.add(contact)
+    db_session.commit()
+    db_session.refresh(contact)
+
+    captured: dict[str, object] = {}
+
+    def fake_run_chat_v2(*args, **kwargs):  # noqa: ANN002,ANN003
+        captured["conversation_id"] = kwargs.get("conversation_id")
+        captured["history_turn_limit"] = kwargs.get("history_turn_limit")
+        return SimpleNamespace(
+            conversation_id=conversation.id,
+            assistant_message_id="assistant-1",
+            answer="ok",
+            provider_name="Graph Runtime",
+            model_name="graph",
+        )
+
+    monkeypatch.setattr("app.services.channel_dispatcher.run_chat_v2", fake_run_chat_v2)
+
+    result = run_channel_message(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        channel="telegram",
+        contact=contact,
+        message="hello",
+    )
+
+    db_session.refresh(contact)
+    assert captured["conversation_id"] == conversation.id
+    assert captured["history_turn_limit"] == 50
+    assert result["conversation_id"] == conversation.id
+    assert contact.active_conversation_id == conversation.id
+    link = db_session.execute(
+        select(ConversationContactLink).where(
+            ConversationContactLink.tenant_id == tenant.id,
+            ConversationContactLink.conversation_id == conversation.id,
+            ConversationContactLink.contact_id == contact.id,
+        )
+    ).scalar_one_or_none()
+    assert link is not None
+
+
+def test_channel_message_legacy_contact_starts_fresh_ignoring_old_links(db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_owner(db_session, email="channels-legacy@example.com")
+
+    old_conversation = ChatConversation(tenant_id=tenant.id, user_id=user.id, title="Old")
+    new_conversation = ChatConversation(tenant_id=tenant.id, user_id=user.id, title="New")
+    db_session.add_all([old_conversation, new_conversation])
+    db_session.flush()
+
+    contact = WorkspaceContact(
+        tenant_id=tenant.id,
+        channel="telegram",
+        external_user_id="legacy-user",
+        name="Legacy",
+        active_conversation_id=None,
+    )
+    db_session.add(contact)
+    db_session.flush()
+    db_session.add(
+        ConversationContactLink(
+            tenant_id=tenant.id,
+            conversation_id=old_conversation.id,
+            contact_id=contact.id,
+        )
+    )
+    db_session.commit()
+
+    captured: dict[str, object] = {}
+
+    def fake_run_chat_v2(*args, **kwargs):  # noqa: ANN002,ANN003
+        captured["conversation_id"] = kwargs.get("conversation_id")
+        return SimpleNamespace(
+            conversation_id=new_conversation.id,
+            assistant_message_id="assistant-legacy",
+            answer="fresh",
+            provider_name="Graph Runtime",
+            model_name="graph",
+        )
+
+    monkeypatch.setattr("app.services.channel_dispatcher.run_chat_v2", fake_run_chat_v2)
+
+    result = run_channel_message(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        channel="telegram",
+        contact=contact,
+        message="continue",
+    )
+
+    db_session.refresh(contact)
+    assert captured["conversation_id"] is None
+    assert result["conversation_id"] == new_conversation.id
+    assert contact.active_conversation_id == new_conversation.id
+
+    new_link = db_session.execute(
+        select(ConversationContactLink).where(
+            ConversationContactLink.tenant_id == tenant.id,
+            ConversationContactLink.conversation_id == new_conversation.id,
+            ConversationContactLink.contact_id == contact.id,
+        )
+    ).scalar_one_or_none()
+    assert new_link is not None
+
+
+def test_channel_new_command_rotates_conversation_without_runtime_call(db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_owner(db_session, email="channels-reset@example.com")
+    old_conversation = ChatConversation(tenant_id=tenant.id, user_id=user.id, title="Old session")
+    db_session.add(old_conversation)
+    db_session.flush()
+    contact = WorkspaceContact(
+        tenant_id=tenant.id,
+        channel="telegram",
+        external_user_id="reset-user",
+        name="Reset",
+        active_conversation_id=old_conversation.id,
+    )
+    db_session.add(contact)
+    db_session.commit()
+    db_session.refresh(contact)
+
+    monkeypatch.setattr(
+        "app.services.channel_dispatcher.run_chat_v2",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("run_chat_v2 should not be called for /new")),
+    )
+
+    result = run_channel_message(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        channel="telegram",
+        contact=contact,
+        message=" /NeW ",
+    )
+
+    db_session.refresh(contact)
+    assert result["conversation_id"] != old_conversation.id
+    assert "Started a new conversation" in result["answer"]
+    assert contact.active_conversation_id == result["conversation_id"]
+
+    reset_audit = db_session.execute(
+        select(AuditLog).where(
+            AuditLog.tenant_id == tenant.id,
+            AuditLog.event_type == "channel.conversation.reset",
+            AuditLog.resource_id == contact.id,
+        )
+    ).scalar_one_or_none()
+    assert reset_audit is not None
+
+
+def test_channel_follow_up_yes_uses_same_active_conversation(db_session, monkeypatch):
+    tenant, user = _seed_tenant_with_owner(db_session, email="channels-followup@example.com")
+    sticky_conversation = ChatConversation(tenant_id=tenant.id, user_id=user.id, title="Pending flow")
+    db_session.add(sticky_conversation)
+    db_session.flush()
+    contact = WorkspaceContact(
+        tenant_id=tenant.id,
+        channel="telegram",
+        external_user_id="flow-user",
+        name="Flow",
+        active_conversation_id=None,
+    )
+    db_session.add(contact)
+    db_session.commit()
+    db_session.refresh(contact)
+
+    calls: list[str | None] = []
+
+    def fake_run_chat_v2(*args, **kwargs):  # noqa: ANN002,ANN003
+        calls.append(kwargs.get("conversation_id"))
+        answer = "Please confirm (yes/no)" if len(calls) == 1 else "Done."
+        return SimpleNamespace(
+            conversation_id=sticky_conversation.id,
+            assistant_message_id=f"assistant-{len(calls)}",
+            answer=answer,
+            provider_name="Calendar Action Engine",
+            model_name="tool-planner",
+        )
+
+    monkeypatch.setattr("app.services.channel_dispatcher.run_chat_v2", fake_run_chat_v2)
+
+    first = run_channel_message(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        channel="telegram",
+        contact=contact,
+        message="delete meeting today 3pm",
+    )
+    second = run_channel_message(
+        db_session,
+        tenant_id=tenant.id,
+        user_id=user.id,
+        channel="telegram",
+        contact=contact,
+        message="yes",
+    )
+
+    db_session.refresh(contact)
+    assert first["conversation_id"] == sticky_conversation.id
+    assert second["conversation_id"] == sticky_conversation.id
+    assert second["answer"] == "Done."
+    assert calls == [None, sticky_conversation.id]
+    assert contact.active_conversation_id == sticky_conversation.id

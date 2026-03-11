@@ -311,6 +311,7 @@ def _dispatch_node(state: GraphState) -> GraphState:
         temperature=state["temperature"],
         provider_id_override=state.get("effective_provider_id"),
         retrieval_limit=state["retrieval_limit"],
+        history_turn_limit=state.get("history_turn_limit", 8),
         allow_fallback=False,
     )
     state["answer"] = knowledge["answer"]

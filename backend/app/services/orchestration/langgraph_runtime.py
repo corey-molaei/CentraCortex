@@ -47,6 +47,7 @@ def _snapshot_state(state: GraphState) -> dict[str, Any]:
         "provider_id_override",
         "effective_provider_id",
         "retrieval_limit",
+        "history_turn_limit",
         "safety_flags",
         "blocked",
         "intent",
@@ -131,6 +132,7 @@ def run_chat_graph(
     retrieval_limit: int,
     client_timezone: str | None,
     client_now_iso: str | None,
+    history_turn_limit: int = 8,
 ) -> GraphExecutionResult:
     state: GraphState = {
         "graph_name": GRAPH_NAME,
@@ -142,6 +144,7 @@ def run_chat_graph(
         "temperature": temperature,
         "provider_id_override": provider_id_override,
         "retrieval_limit": retrieval_limit,
+        "history_turn_limit": max(1, int(history_turn_limit)),
         "client_timezone": client_timezone,
         "client_now_iso": client_now_iso,
         "blocked": False,

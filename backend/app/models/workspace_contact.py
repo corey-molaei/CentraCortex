@@ -17,6 +17,12 @@ class WorkspaceContact(Base):
     tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
     channel: Mapped[str] = mapped_column(String(50), index=True)
     external_user_id: Mapped[str] = mapped_column(String(255), index=True)
+    active_conversation_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("chat_conversations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(64), nullable=True)
     email: Mapped[str | None] = mapped_column(String(320), nullable=True)

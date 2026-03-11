@@ -536,6 +536,7 @@ def run_knowledge_generation(
     temperature: float,
     provider_id_override: str | None,
     retrieval_limit: int,
+    history_turn_limit: int = 8,
     allow_fallback: bool = True,
 ) -> tuple[LLMProvider, dict]:
     retrieval_query = _normalize_retrieval_query(last_user_msg)
@@ -609,7 +610,7 @@ def run_knowledge_generation(
     )
     context_block = _retrieval_context(citations)
 
-    prior_history = _history_messages(db, conversation_id=conversation.id, limit=8)
+    prior_history = _history_messages(db, conversation_id=conversation.id, limit=max(1, int(history_turn_limit)))
     llm_messages = [{"role": "system", "content": f"{SYSTEM_PROMPT}\n\nRetrieved context:\n{context_block}"}]
     for item in prior_history:
         if item.role in {"user", "assistant"}:
@@ -796,6 +797,7 @@ def run_chat_v2(
     retrieval_limit: int,
     client_timezone: str | None = None,
     client_now_iso: str | None = None,
+    history_turn_limit: int = 8,
 ):
     from app.services.orchestration.langgraph_runtime import run_chat_graph
 
@@ -810,6 +812,7 @@ def run_chat_v2(
         retrieval_limit=retrieval_limit,
         client_timezone=client_timezone,
         client_now_iso=client_now_iso,
+        history_turn_limit=history_turn_limit,
     )
 
 
