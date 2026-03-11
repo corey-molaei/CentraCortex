@@ -87,28 +87,33 @@ def _read_channel(name: str, row) -> ChannelConnectorRead:
 
 
 def _build_public_api_base(request: Request) -> str:
+    forwarded_proto = request.headers.get("X-Forwarded-Proto")
+    forwarded_host = request.headers.get("X-Forwarded-Host")
+    request_base = str(request.base_url).rstrip("/")
+    parsed_request = urlparse(request_base)
+    request_host = (parsed_request.hostname or "").lower()
+    request_is_local = request_host in {"localhost", "127.0.0.1", "0.0.0.0", "testserver"} or request_host.endswith(".local")
+
     configured = (settings.api_base_url or "").strip()
     if configured:
         parsed = urlparse(configured)
         host = (parsed.hostname or "").lower()
         is_local = host in {"localhost", "127.0.0.1", "0.0.0.0", "testserver"} or host.endswith(".local")
-        if parsed.scheme == "https":
+        if parsed.scheme == "https" and parsed.netloc:
             return configured.rstrip("/")
-        if parsed.scheme == "http" and is_local:
+        if parsed.scheme == "http" and is_local and request_is_local:
             return configured.rstrip("/")
-        if parsed.scheme in {"http", "https"} and parsed.netloc:
+        if parsed.scheme in {"http", "https"} and parsed.netloc and not is_local:
             return configured.replace("http://", "https://", 1).rstrip("/")
 
-    forwarded_proto = request.headers.get("X-Forwarded-Proto")
-    forwarded_host = request.headers.get("X-Forwarded-Host")
     if forwarded_proto and forwarded_host:
         scheme = "https" if forwarded_proto.lower() != "http" else "http"
         if forwarded_host.lower().startswith(("localhost", "127.0.0.1", "0.0.0.0", "testserver")):
             return f"{scheme}://{forwarded_host}".rstrip("/")
         return f"https://{forwarded_host}".rstrip("/")
 
-    fallback = str(request.base_url).rstrip("/")
-    parsed_fallback = urlparse(fallback)
+    fallback = request_base
+    parsed_fallback = parsed_request
     host = (parsed_fallback.hostname or "").lower()
     is_local = host in {"localhost", "127.0.0.1", "0.0.0.0", "testserver"} or host.endswith(".local")
     if fallback.startswith("http://") and not is_local:
@@ -319,6 +324,7 @@ def test_telegram(
             "telegram_webhook_registration_failed",
             tenant_id=membership.tenant_id,
             connector_id=row.id,
+            webhook_url=webhook_url,
             error=str(exc),
         )
         return ChannelTestResponse(success=False, message=f"Telegram webhook registration failed: {exc}")
