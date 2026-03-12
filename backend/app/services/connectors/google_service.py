@@ -1454,10 +1454,14 @@ def sync_contacts(db: Session, connector: GoogleUserConnector, *, access_token: 
         emails = person.get("emailAddresses") or []
         phones = person.get("phoneNumbers") or []
         orgs = person.get("organizations") or []
-        display_name = str((names[0] or {}).get("displayName") or resource_name)
-        email_value = str((emails[0] or {}).get("value") or "")
-        phone_value = str((phones[0] or {}).get("value") or "")
-        org_value = str((orgs[0] or {}).get("name") or "")
+        primary_name = names[0] if names else {}
+        primary_email = emails[0] if emails else {}
+        primary_phone = phones[0] if phones else {}
+        primary_org = orgs[0] if orgs else {}
+        display_name = str((primary_name or {}).get("displayName") or resource_name)
+        email_value = str((primary_email or {}).get("value") or "")
+        phone_value = str((primary_phone or {}).get("value") or "")
+        org_value = str((primary_org or {}).get("name") or "")
         raw_text_lines = [
             display_name,
             f"Email: {email_value}" if email_value else "",

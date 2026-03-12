@@ -569,6 +569,62 @@ def test_google_sync_writes_private_docs_with_account_prefixed_ids(client, db_se
     assert policy.allowed_user_ids == [user.id]
 
 
+def test_google_sync_contacts_handles_missing_primary_arrays(client, db_session, monkeypatch):
+    tenant = _seed_tenant(db_session, slug="google-contacts-empty-fields")
+    user = _seed_user(db_session, tenant=tenant, email="contacts-empty@example.com", is_default=True)
+    token = _login(client, email=user.email)
+
+    account_id = _create_account(
+        client,
+        token,
+        tenant.id,
+        gmail_enabled=False,
+        calendar_enabled=False,
+        contacts_enabled=True,
+    )
+    account = db_session.get(GoogleUserConnector, account_id)
+    assert account is not None
+    account.access_token_encrypted = encrypt_secret("token")
+    account.refresh_token_encrypted = encrypt_secret("refresh")
+    account.token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    db_session.commit()
+
+    def fake_google_request(**kwargs):
+        url = kwargs["url"]
+        if kwargs["method"] == "GET" and url.endswith("/people/me/connections"):
+            return {
+                "connections": [
+                    {
+                        "resourceName": "people/c123",
+                        "names": [],
+                        "emailAddresses": [],
+                        "phoneNumbers": [],
+                        "organizations": [],
+                    }
+                ]
+            }
+        return {}
+
+    monkeypatch.setattr("app.services.connectors.google_service._google_request", fake_google_request)
+
+    synced = client.post(
+        f"/api/v1/connectors/google/accounts/{account_id}/sync",
+        headers=_auth(token, tenant.id),
+    )
+    assert synced.status_code == 200
+    assert synced.json()["items_synced"] == 1
+
+    doc = db_session.execute(
+        select(Document).where(
+            Document.tenant_id == tenant.id,
+            Document.source_type == "google_contacts",
+            Document.source_id == f"{account_id}:contacts:people/c123",
+        )
+    ).scalar_one_or_none()
+    assert doc is not None
+    assert "people/c123" in doc.raw_text
+
+
 def test_new_account_requires_sync_scope_before_sync(client, db_session):
     tenant = _seed_tenant(db_session, slug="google-sync-scope-required")
     user = _seed_user(db_session, tenant=tenant, email="scope-required@example.com", is_default=True)
