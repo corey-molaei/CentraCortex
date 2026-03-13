@@ -129,6 +129,7 @@ mcp_server = FastMCP(
         "Mutating tools default to preview mode and require execute=true for real side effects."
     ),
     streamable_http_path="/",
+    json_response=True,
     transport_security=_build_transport_security_settings(),
 )
 
