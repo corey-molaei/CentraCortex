@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     secret_key: str = "change-me"
     encryption_key: str = "change-me-32-byte-base64-key"
     algorithm: str = "HS256"
-    access_token_expire_minutes: int = 30
+    access_token_expire_minutes: int = 14400
     refresh_token_expire_days: int = 14
     password_reset_token_expire_minutes: int = 30
 
