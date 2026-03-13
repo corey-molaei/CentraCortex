@@ -70,8 +70,12 @@ def _seed_google_account(
 
 
 def _mcp_initialize(client, headers: dict[str, str]) -> str:
+    return _mcp_initialize_at_path(client, headers, "/api/v1/mcp/")
+
+
+def _mcp_initialize_at_path(client, headers: dict[str, str], path: str) -> str:
     response = client.post(
-        "/api/v1/mcp/",
+        path,
         headers={
             "Host": "localhost:8000",
             "Accept": "application/json, text/event-stream",
@@ -166,6 +170,14 @@ def test_mcp_requires_auth(client):
         },
     )
     assert response.status_code == 401
+
+
+def test_mcp_initialize_accepts_url_without_trailing_slash(client, db_session):
+    tenant, user, _ = _seed_user_and_tenant(db_session, email="noslash@example.com")
+    token = create_access_token(user.id, tenant.id)
+    headers = {"Authorization": f"Bearer {token}", "X-Tenant-ID": tenant.id}
+    session_id = _mcp_initialize_at_path(client, headers, "/api/v1/mcp")
+    assert session_id
 
 
 def test_mcp_lists_built_in_tools_for_authenticated_client(client, db_session):

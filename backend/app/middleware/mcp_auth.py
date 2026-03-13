@@ -24,7 +24,13 @@ class MCPAuthContext:
 
 class MCPAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
-        if not request.url.path.startswith("/api/v1/mcp"):
+        path = request.scope.get("path", "")
+        if path == "/api/v1/mcp":
+            request.scope["path"] = "/api/v1/mcp/"
+            request.scope["raw_path"] = b"/api/v1/mcp/"
+            path = "/api/v1/mcp/"
+
+        if not path.startswith("/api/v1/mcp"):
             return await call_next(request)
 
         auth_header = str(request.headers.get("Authorization") or "")
