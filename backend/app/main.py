@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.logging import configure_logging
+from app.db.session import SessionLocal
+from app.middleware.mcp_auth import MCPAuthMiddleware
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.request_context import RequestContextMiddleware
 from app.middleware.request_signing import RequestSigningMiddleware
@@ -43,6 +45,7 @@ from app.routers.connectors import (
     sharepoint,
     slack,
 )
+from app.services.mcp_server import get_mcp_asgi_app, start_mcp_server, stop_mcp_server
 
 configure_logging()
 
@@ -53,8 +56,10 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+app.state.db_session_factory = SessionLocal
 
 app.add_middleware(RequestContextMiddleware)
+app.add_middleware(MCPAuthMiddleware)
 app.add_middleware(RequestSigningMiddleware)
 app.add_middleware(RateLimitMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
@@ -107,6 +112,18 @@ app.include_router(db.router, prefix="/api/v1")
 app.include_router(logs.router, prefix="/api/v1")
 app.include_router(file_upload.router, prefix="/api/v1")
 app.include_router(chat_v2.router, prefix="/api/v2")
+app.mount("/api/v1/mcp", get_mcp_asgi_app())
+
+
+@app.on_event("startup")
+async def startup_mcp_runtime() -> None:
+    app.state.mcp_runtime_cm = await start_mcp_server()
+
+
+@app.on_event("shutdown")
+async def shutdown_mcp_runtime() -> None:
+    await stop_mcp_server(getattr(app.state, "mcp_runtime_cm", None))
+    app.state.mcp_runtime_cm = None
 
 
 @app.get("/")

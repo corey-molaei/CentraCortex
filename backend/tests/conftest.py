@@ -52,9 +52,11 @@ def client(db_session):
             pass
 
     app.dependency_overrides[get_db] = override_get_db
+    app.state.db_session_factory = TestingSessionLocal
     with TestClient(app) as c:
         yield c
     app.dependency_overrides.clear()
+    app.state.db_session_factory = TestingSessionLocal
 
 
 @pytest.fixture(autouse=True)
